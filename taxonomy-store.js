@@ -160,6 +160,29 @@
     return { applied: true, categories: tree.categories.length };
   }
 
+  /**
+   * Merges a legacy {category: [sections]} map (schema-1 package adopted by the administrator) into this specialty's tree.
+   * Existing categories/sections are matched by name (case-insensitive); nothing is removed or renamed.
+   */
+  async function mergeLegacyMap(map) {
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return { categoriesAdded: 0, sectionsAdded: 0 };
+    var tree = draft();
+    var categoriesAdded = 0, sectionsAdded = 0;
+    Object.keys(map).forEach(function (catName) {
+      var n = Core.normalizeName(catName);
+      if (!n) return;
+      var cat = tree.categories.filter(function (c) { return Core.nameKey(c.name) === Core.nameKey(n); })[0];
+      if (!cat) { try { cat = addCategory(tree, n); categoriesAdded++; } catch (e) { return; } }
+      (Array.isArray(map[catName]) ? map[catName] : []).forEach(function (secName) {
+        var sn = Core.normalizeName(secName);
+        if (!sn || cat.sections.some(function (s) { return Core.nameKey(s.name) === Core.nameKey(sn); })) return;
+        try { addSection(tree, cat.id, sn); sectionsAdded++; } catch (e) { /* skip a bad name */ }
+      });
+    });
+    if (categoriesAdded || sectionsAdded) await save(tree);
+    return { categoriesAdded: categoriesAdded, sectionsAdded: sectionsAdded };
+  }
+
   /** The tree as it travels in a package (taxonomyV2) plus the legacy {category: [sections]} map. */
   function exportV2() {
     var t = clone(get());
@@ -216,7 +239,7 @@
 
   window.EntTaxonomy = {
     KEY: KEY, BASELINE_AT: BASELINE_AT, load: load, get: get, hasCustomTree: hasCustomTree, isBaseline: isBaseline, index: index, asScottBrownShape: asScottBrownShape,
-    save: save, draft: draft, applyFromPackage: applyFromPackage, exportV2: exportV2, exportLegacyMap: exportLegacyMap,
+    save: save, draft: draft, applyFromPackage: applyFromPackage, mergeLegacyMap: mergeLegacyMap, exportV2: exportV2, exportLegacyMap: exportLegacyMap,
     onChange: function (cb) { if (typeof cb === 'function') listeners.push(cb); },
     ops: { findCategory: findCategory, findSection: findSection, addCategory: addCategory, addSection: addSection, move: move },
     _fromScottBrown: fromScottBrown

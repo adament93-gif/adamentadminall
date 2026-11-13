@@ -1,4 +1,4 @@
-const CACHE_NAME = "adam-qbank-admin-v18-1.4.0";
+const CACHE_NAME = "adam-qbank-admin-v21-1.4.0";
 
 const STATIC_CACHE = [
   "./",

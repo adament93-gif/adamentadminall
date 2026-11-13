@@ -48,7 +48,32 @@
                 'General is the application\'s built-in fallback topic; do not invent new classifications.',
                 'When no specific branch fits confidently, use Uncategorized / General / General and report the question for review.'
             ],
-            classifications
+            classifications,
+            // How an update package for THIS specialty must be built. Tools (or an AI) that generate packages from a
+            // book must follow this, otherwise the manager refuses the file ("does not say which specialty...").
+            packageFormat: {
+                fileExtension: '.qbpkg',
+                archive: 'A zip file with manifest.json and database.json at its ROOT (not inside a folder). Question images go in images/<file>.',
+                manifest: {
+                    schemaVersion: 2,
+                    packageId: '<any stable id, e.g. ' + ((cur && cur.id) || 'specialty') + '-book-1>',
+                    packageVersion: '<numbers and dots, e.g. 2026.11.11>',
+                    exportType: 'full',
+                    specialty: cur ? { id: cur.id, name: cur.name } : { id: '<specialty id>', name: '<specialty name>' },
+                    checksum: '<SHA-256 hex of the exact bytes of database.json>'
+                },
+                database: {
+                    schemaVersion: 2,
+                    specialtyId: (cur && cur.id) || '<specialty id>',
+                    questions: '[ { uid, questionText, options: {A,B,C,D,E?}, correctAnswer: "A".."E", explanation, subject, chapter, topic, subtopic?, book?, difficulty?: Easy|Medium|Hard, tags?: [], images?: [] } ]'
+                },
+                notes: [
+                    'schemaVersion 2 and the specialty are REQUIRED in both files; a package without them is treated as an old Adam ENT (schema 1) package.',
+                    'subject / chapter / topic must be branches from "classifications" above, with the exact spelling.',
+                    'uid must be unique inside the package and stable across versions of the same question (re-exporting the same question with a higher packageVersion updates it instead of duplicating it).',
+                    'checksum = SHA-256 of database.json exactly as written into the zip (compute it after the file is final).'
+                ]
+            }
         };
     }
 

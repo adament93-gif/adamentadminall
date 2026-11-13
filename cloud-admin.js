@@ -7,7 +7,7 @@
  *   packs/<specialtyId>/chunks/...    the compressed package of THAT specialty, in ~600 KB pieces
  *   packs/main                        (ENT only, optional) legacy copy for students still on app 1.3.x
  *   settings/access                   subscriptionScope: 'selected' (own specialty) or 'all' (every specialty);
- *                                     trialDays: length of the free trial of a new account (default 5, 0 = no trial)
+ *                                     trialDays: no longer used (no free trial since 13 Nov 2026; saved as 0)
  *   users/<uid>                       student accounts (specialty, subscription)
  *   reports/<id>                      question reports, each tagged with the student's specialty
  *
@@ -190,7 +190,7 @@
 
   /* ------------------------------------------------------------------ subscription scope */
 
-  var DEFAULT_TRIAL_DAYS = 5; // the Firestore rules and the Student app use the same default
+  var DEFAULT_TRIAL_DAYS = 0; // no free trial since 13 Nov 2026 (the rules ignore trialDays)
   var accessSettings = { scope: 'selected', trialDays: DEFAULT_TRIAL_DAYS };
 
   // settings/access: who an active subscription covers and how long a new account's free trial lasts.
@@ -342,6 +342,8 @@
       specialtyName: strOf(f.specialtyName),
       phone: strOf(f.phone),
       contactConsent: !!(f.contactConsent && f.contactConsent.booleanValue === true),
+      lastCode: strOf(f.lastCode),
+      lastCodeAt: tsMs(f.lastCodeAt),
       request: req ? { specialtyId: strOf(req.specialtyId), specialtyName: strOf(req.specialtyName), requestedAt: tsMs(req.requestedAt) || 0 } : null
     };
   }
@@ -368,12 +370,6 @@
     return new Date(ms).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
   }
 
-  // End of this account's free trial (ms), or null when it has none. Mirrors the Firestore rules and the Student app.
-  function trialEndOf(a) {
-    if (a.trialStopped || !a.createdAt) return null;
-    return a.trialEndsAt || a.createdAt + accessSettings.trialDays * 86400000;
-  }
-
   function accessOf(a) {
     var now = Date.now();
     var paid = a.plan !== 'none' && !!a.expiresAt;
@@ -381,15 +377,8 @@
       var days = Math.ceil((a.expiresAt - now) / 86400000);
       return { kind: 'active', text: 'Active until ' + fmtDay(a.expiresAt) + ' (' + days + (days === 1 ? ' day' : ' days') + ' left)' };
     }
-    var end = trialEndOf(a);
-    if (end && end > now && a.createdAt <= now + 5 * 60000) {
-      var left = Math.ceil((end - now) / 86400000);
-      return { kind: 'trial', text: 'Free trial: ' + left + (left === 1 ? ' day' : ' days') + ' left (until ' + fmtDay(end) + ')' };
-    }
     if (paid) return { kind: 'expired', text: 'Expired on ' + fmtDay(a.expiresAt) };
-    if (a.trialStopped) return { kind: 'free', text: 'Free (trial ended by you, no subscription)' };
-    if (end) return { kind: 'free', text: 'Free (trial ended on ' + fmtDay(end) + ', no subscription)' };
-    return { kind: 'free', text: 'Free (no subscription)' };
+    return { kind: 'free', text: 'Free version (no subscription)' };
   }
 
   function addMonths(ms, n) {
@@ -482,14 +471,26 @@
 
   function accountsCardHTML() {
     return '<div class="card"><div class="card-header">Student accounts</div>' +
-      '<p style="font-size:0.85rem;color:var(--text2);">Every account that signs up appears here with the specialty it chose. Each new account gets a free trial (set under Subscription scope & free trial); after it ends only your Free questions stay open until you activate a subscription. Activate it for as long as you agree with the student; the app unlocks the question bank on their next launch. A student can only use their own specialty\'s questions.</p>' +
+      '<p style="font-size:0.85rem;color:var(--text2);">Every account that signs up appears here with the specialty it chose. A new account starts on the free version (only the questions you mark Free, up to 250). It gets the full bank when the student pays online (activated automatically, see Online payments), uses an activation code, or you activate it here (+1/+3/+12 months, Set date). The app unlocks the question bank on their next launch. A student can only use their own specialty\'s questions.</p>' +
       '<button class="btn btn-outline btn-block" id="btnAcctLoad">Load accounts</button>' +
       '<input type="search" id="entAcctFilter" placeholder="Search username, email or mobile number" autocomplete="off" autocapitalize="none" spellcheck="false" style="margin-top:10px;">' +
       '<select id="entAcctSpec" aria-label="Filter by specialty" style="margin-top:8px;"></select>' +
       '<div id="entAcctSummary" style="margin:6px 0;font-size:0.82rem;color:var(--text2);"></div>' +
       '<div id="entAcctBulk"></div>' +
       '<div id="entAcctList"></div>' +
-      '<div id="entAcctMsg" style="margin-top:8px;font-size:0.82rem;color:var(--text2);"></div></div>';
+      '<div id="entAcctMsg" style="margin-top:8px;font-size:0.82rem;color:var(--text2);"></div>' +
+      '<hr style="border:none;border-top:1px solid var(--border);margin:14px 0;">' +
+      '<div style="font-weight:700;margin-bottom:4px;">Activation codes</div>' +
+      '<p style="font-size:0.82rem;color:var(--text2);margin-bottom:8px;">For students who pay you another way (cash, transfer, agreed on WhatsApp): activate the account here (+1 / +3 / +12 months) or tap <b>Activation code</b>, choose the plan and send the code on WhatsApp with one tap. ' +
+      'The student enters it in the app (Subscribe → I have an activation code) and the subscription starts at once. A code works once, only for that account, and expires if unused.</p>' +
+      '<button class="btn btn-outline btn-block" id="btnCodesLoad">Show recent codes</button>' +
+      '<div id="entCodesList" style="margin-top:8px;"></div>' +
+      '<hr style="border:none;border-top:1px solid var(--border);margin:14px 0;">' +
+      '<div style="font-weight:700;margin-bottom:4px;">Online payments (Wayl)</div>' +
+      '<p style="font-size:0.82rem;color:var(--text2);margin-bottom:8px;">Payments made with <b>Pay online</b> in the app. The payment Worker activates the account by itself once Wayl confirms the payment; nothing to do here. ' +
+      '<b>Paid</b> = paid but not activated yet (it retries; you can also activate the account by hand). <b>AmountMismatch</b> = the amount differs from the price, nothing was activated: check it in your Wayl dashboard.</p>' +
+      '<button class="btn btn-outline btn-block" id="btnPaymentsLoad">Show recent payments</button>' +
+      '<div id="entPaymentsList" style="margin-top:8px;"></div></div>';
   }
 
   function fillSpecFilter() {
@@ -509,7 +510,7 @@
     var filterEl = el('entAcctFilter');
     var q = filterEl ? filterEl.value.trim().toLowerCase() : '';
     var specFilter = (el('entAcctSpec') || {}).value || 'all';
-    var counts = { active: 0, trial: 0, expired: 0, free: 0 };
+    var counts = { active: 0, expired: 0, free: 0 };
     accounts.forEach(function (a) { counts[accessOf(a).kind]++; });
     var unassigned = accounts.filter(function (a) { return !a.specialtyId; }).length;
     var requests = accounts.filter(function (a) { return a.request; }).length;
@@ -517,7 +518,7 @@
     var summary = el('entAcctSummary');
     if (summary) {
       summary.textContent = accounts.length
-        ? accounts.length + ' account(s): ' + counts.active + ' active, ' + counts.trial + ' on trial, ' + counts.expired + ' expired, ' + counts.free + ' free · ' + requests + ' change request(s) · ' + unassigned + ' without a specialty · ' + withPhone + ' with a mobile number'
+        ? accounts.length + ' account(s): ' + counts.active + ' active, ' + counts.expired + ' expired, ' + counts.free + ' free · ' + requests + ' change request(s) · ' + unassigned + ' without a specialty · ' + withPhone + ' with a mobile number'
         : '';
     }
     var bulk = el('entAcctBulk');
@@ -615,21 +616,28 @@
         row.appendChild(rq);
       }
 
+      if (a.lastCode) {
+        var lc = document.createElement('div');
+        lc.className = 'ent-acct-lastcode';
+        lc.style.cssText = 'font-size:0.78rem;color:var(--text-muted);margin:2px 0 0;';
+        lc.textContent = 'Last activation code used: ' + formatCode(a.lastCode) + (a.lastCodeAt ? ' on ' + fmtDay(a.lastCodeAt) : '');
+        row.appendChild(lc);
+      }
+
       var status = document.createElement('div');
       status.className = 'ent-acct-status';
       status.style.cssText = 'font-size:0.85rem;margin:4px 0 8px;color:' +
-        (st.kind === 'active' || st.kind === 'trial' ? 'var(--success,#16a34a)' : st.kind === 'expired' ? 'var(--danger,#dc2626)' : 'var(--text2)') + ';';
+        (st.kind === 'active' ? 'var(--success,#16a34a)' : st.kind === 'expired' ? 'var(--danger,#dc2626)' : 'var(--text2)') + ';';
       status.textContent = st.text;
       row.appendChild(status);
 
       var actions = document.createElement('div');
       actions.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
-      [['m1', '+1 month'], ['m3', '+3 months'], ['m12', '+12 months'], ['date', 'Set date'],
-        [st.kind === 'trial' ? 'trial-end' : 'trial-start', st.kind === 'trial' ? 'End trial' : 'Start trial'],
+      [['code', 'Activation code'], ['m1', '+1 month'], ['m3', '+3 months'], ['m12', '+12 months'], ['date', 'Set date'],
         ['spec', 'Change specialty'], ['stop', 'Stop']].forEach(function (pair) {
         var b2 = document.createElement('button');
         b2.type = 'button';
-        b2.className = 'btn btn-sm ' + (pair[0] === 'stop' ? 'btn-danger' : 'btn-outline');
+        b2.className = 'btn btn-sm ' + (pair[0] === 'stop' ? 'btn-danger' : pair[0] === 'code' ? 'btn-primary' : 'btn-outline');
         b2.setAttribute('data-act', pair[0]);
         b2.textContent = pair[1];
         actions.appendChild(b2);
@@ -669,6 +677,7 @@
     var row = btn.closest('.ent-acct');
     var a = accounts.filter(function (x) { return row && x.uid === row.getAttribute('data-uid'); })[0];
     if (!a) return;
+    if (act === 'code') return issueCodeFor(a);
     try {
       if (act === 'm1') await extendAccount(a, 1, '1m');
       else if (act === 'm3') await extendAccount(a, 3, '3m');
@@ -683,18 +692,8 @@
         if (!when || isNaN(when.getTime()) || when.getMonth() !== Number(m[2]) - 1) return acctMsg('Enter the date as YYYY-MM-DD, for example 2027-03-15.', true);
         await saveAccess(a, 'custom', when.getTime());
       } else if (act === 'stop') {
-        if (!window.confirm('Stop access for ' + a.identifier + '? This ends the subscription AND any free trial. They keep their progress but only the Free questions stay open.')) return;
+        if (!window.confirm('Stop the subscription of ' + a.identifier + '? They keep their progress but only the Free questions stay open.')) return;
         await saveAccess(a, 'none', null);
-        await saveTrial(a, null);
-      } else if (act === 'trial-end') {
-        if (!window.confirm('End the free trial of ' + a.identifier + ' now? They keep their progress but only the Free questions stay open (unless they subscribe).')) return;
-        await saveTrial(a, null);
-      } else if (act === 'trial-start') {
-        var typedDays = window.prompt('Free trial for ' + a.identifier + ': how many days from today (1-365)?', String(accessSettings.trialDays || DEFAULT_TRIAL_DAYS));
-        if (typedDays === null) return;
-        var nDays = Number(String(typedDays).trim());
-        if (!isFinite(nDays) || nDays < 1 || nDays > 365 || Math.floor(nDays) !== nDays) return acctMsg('Enter a whole number of days from 1 to 365.', true);
-        await saveTrial(a, nDays);
       } else if (act === 'spec') {
         var chosen = await chooseSpecialty(a);
         if (!chosen || chosen.id === a.specialtyId) return;
@@ -765,6 +764,257 @@
     if (list) list.addEventListener('click', onAccountAction);
     var bulk = el('entAcctBulk');
     if (bulk) bulk.addEventListener('click', onAccountAction);
+    var codesBtn = el('btnCodesLoad');
+    if (codesBtn) codesBtn.addEventListener('click', async function () {
+      if (typeof RBAC !== 'undefined' && !RBAC.requireAdmin()) return;
+      codesBtn.disabled = true;
+      try { await loadCodes(); renderCodes(); } catch (e) { var box = el('entCodesList'); if (box) box.textContent = 'Could not load codes: ' + friendly(e); }
+      finally { codesBtn.disabled = false; }
+    });
+    var codesList = el('entCodesList');
+    if (codesList) codesList.addEventListener('click', onCodeAction);
+    if (codes.length) renderCodes();
+    var payBtn = el('btnPaymentsLoad');
+    if (payBtn) payBtn.addEventListener('click', async function () {
+      if (typeof RBAC !== 'undefined' && !RBAC.requireAdmin()) return;
+      payBtn.disabled = true;
+      try { await loadPayments(); renderPayments(); } catch (e) { var box = el('entPaymentsList'); if (box) box.textContent = 'Could not load payments: ' + friendly(e); }
+      finally { payBtn.disabled = false; }
+    });
+    if (payments.length) renderPayments();
+  }
+
+  /* ------------------------------------------------------------------ activation codes */
+
+  // Plans a code can carry. Days (not calendar months) so the server rules can check the arithmetic exactly.
+  var CODE_PLANS = [
+    { id: '1m', label: '1 month', labelAr: 'شهر واحد', days: 30 },
+    { id: '3m', label: '3 months', labelAr: '3 أشهر', days: 90 },
+    { id: '12m', label: '12 months', labelAr: '12 شهراً', days: 365 }
+  ];
+  var CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 32 symbols: no 0/O/1/I, so a code read aloud or typed is unambiguous
+  var CODE_LENGTH = 10;
+  var codes = [];
+
+  function newCode() {
+    var bytes = new Uint8Array(CODE_LENGTH);
+    crypto.getRandomValues(bytes);
+    var out = '';
+    for (var i = 0; i < bytes.length; i++) out += CODE_ALPHABET[bytes[i] % 32]; // 256 % 32 == 0: no bias
+    return out;
+  }
+
+  function formatCode(c) { return String(c || '').replace(/(.{4})(?=.)/g, '$1-'); }
+
+  // Creates codes/{code} for one account and one plan. The rules require createdAt == server time, unused, admin only.
+  async function createCode(a, plan, validDays) {
+    var tk = await token();
+    var me = load(SESSION_KEY) || {};
+    var validUntil = new Date(Date.now() + validDays * 86400000).toISOString();
+    for (var attempt = 0; attempt < 4; attempt++) {
+      var code = newCode();
+      try {
+        await request(FS + ':commit', {
+          method: 'POST', headers: authHeaders(tk, true),
+          body: JSON.stringify({ writes: [{
+            update: { name: FS.replace('https://firestore.googleapis.com/v1/', '') + '/codes/' + code, fields: {
+              uid: sv(a.uid), identifier: sv(a.identifier), plan: sv(plan.id), planLabel: sv(plan.label), days: iv(plan.days),
+              createdBy: sv(me.uid || ''), validUntil: tv(validUntil), usedAt: { nullValue: null }, usedBy: { nullValue: null } } },
+            currentDocument: { exists: false },
+            updateTransforms: [{ fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }]
+          }] })
+        });
+        var rec = { code: code, uid: a.uid, identifier: a.identifier, plan: plan.id, planLabel: plan.label, days: plan.days,
+          createdAt: Date.now(), validUntil: Date.parse(validUntil), usedAt: null, usedBy: null };
+        codes.unshift(rec);
+        return rec;
+      } catch (e) {
+        if (e.status === 409 || e.code === 'ALREADY_EXISTS') continue; // astronomically rare: try another code
+        throw e;
+      }
+    }
+    throw cloudError('CODE_COLLISION');
+  }
+
+  // The message the student receives on WhatsApp (written outside the app, by you).
+  function codeMessage(rec) {
+    var plan = CODE_PLANS.filter(function (p) { return p.id === rec.plan; })[0] || { labelAr: rec.planLabel, label: rec.planLabel };
+    var until = new Date(rec.validUntil).toLocaleDateString('en-GB', { year: 'numeric', month: 'short', day: 'numeric' });
+    return 'Adam QBank\n' +
+      'رمز التفعيل الخاص بك: ' + formatCode(rec.code) + '\n' +
+      'الباقة: ' + plan.labelAr + ' (' + rec.days + ' يوماً)\n' +
+      'الحساب: ' + rec.identifier + '\n\n' +
+      'افتح التطبيق ← الإعدادات (Settings) ← Access ← Enter activation code، واكتب الرمز.\n' +
+      'الرمز يعمل مرة واحدة ولهذا الحساب فقط، وصالح حتى ' + until + '.\n\n' +
+      'Your activation code: ' + formatCode(rec.code) + ' (' + plan.label + ', account ' + rec.identifier + ').';
+  }
+
+  function issueCodeFor(a) {
+    var html = '<h3>Activation code</h3>' +
+      '<p style="font-size:0.9rem;margin:6px 0 12px;">Account: <b>' + esc(a.identifier) + '</b><br>' + esc(accessOf(a).text) + '</p>' +
+      '<label class="modal-field">Plan<select id="entCodePlan">' +
+      CODE_PLANS.map(function (p) { return '<option value="' + p.id + '">' + esc(p.label) + ' (' + p.days + ' days)</option>'; }).join('') + '</select></label>' +
+      '<label class="modal-field">The code must be used within<select id="entCodeValid"><option value="3">3 days</option><option value="7" selected>7 days</option><option value="30">30 days</option></select></label>' +
+      '<p style="font-size:0.8rem;color:var(--text2);">The days are added to the account: from today, or from the current end date if Premium is still running.</p>' +
+      '<div id="entCodeErr" style="color:var(--danger);font-size:0.85rem;min-height:1.2em;"></div>' +
+      '<button type="button" class="btn btn-primary btn-block" id="entCodeCreate">Create code</button>' +
+      '<button type="button" class="btn btn-outline btn-block mt-2" id="entCodeCancel">Cancel</button>';
+    showModal(html);
+    el('entCodeCancel').addEventListener('click', closeModal);
+    el('entCodeCreate').addEventListener('click', async function () {
+      var btn = el('entCodeCreate');
+      var plan = CODE_PLANS.filter(function (p) { return p.id === el('entCodePlan').value; })[0];
+      var validDays = Number(el('entCodeValid').value) || 7;
+      btn.disabled = true; btn.textContent = 'Creating...';
+      try {
+        var rec = await createCode(a, plan, validDays);
+        showCodeResult(a, rec);
+        renderCodes();
+      } catch (e) {
+        btn.disabled = false; btn.textContent = 'Create code';
+        el('entCodeErr').textContent = 'Could not create the code: ' + friendly(e);
+      }
+    });
+  }
+
+  function showCodeResult(a, rec) {
+    var wa = a.phone ? whatsappLink(a.phone) : '';
+    var html = '<h3>Code for ' + esc(a.identifier) + '</h3>' +
+      '<div id="entCodeValue" dir="ltr" style="font:700 1.7rem/1.2 ui-monospace,Menlo,Consolas,monospace;letter-spacing:.12em;text-align:center;padding:16px 8px;margin:10px 0;border:2px dashed var(--primary);border-radius:14px;user-select:all;">' + esc(formatCode(rec.code)) + '</div>' +
+      '<p style="font-size:0.85rem;color:var(--text2);margin:0 0 12px;">' + esc(rec.planLabel) + ' · ' + rec.days + ' days · must be used by ' + esc(fmtDay(rec.validUntil)) + '</p>' +
+      (wa ? '<a class="btn btn-success btn-block" id="entCodeWa" target="_blank" rel="noopener noreferrer" style="text-decoration:none;" href="' + esc(wa + '?text=' + encodeURIComponent(codeMessage(rec))) + '">Send on WhatsApp to ' + esc(fmtPhone(a.phone)) + '</a>'
+          : '<p style="font-size:0.85rem;color:var(--warning,#b45309);">This account has no mobile number. Copy the code and send it yourself.</p>') +
+      '<button type="button" class="btn btn-outline btn-block mt-2" id="entCodeCopy">Copy message</button>' +
+      '<button type="button" class="btn btn-outline btn-block mt-2" id="entCodeDone">Done</button>';
+    showModal(html);
+    el('entCodeDone').addEventListener('click', closeModal);
+    el('entCodeCopy').addEventListener('click', function () {
+      var text = codeMessage(rec);
+      var done = function () { el('entCodeCopy').textContent = 'Copied'; };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, function () { window.prompt('Copy the message:', text); });
+      else window.prompt('Copy the message:', text);
+    });
+    acctMsg('Code ' + formatCode(rec.code) + ' created for ' + a.identifier + ' (' + rec.planLabel + ').');
+  }
+
+  function parseCode(doc) {
+    var f = doc.fields || {};
+    return { code: idOf(doc), uid: strOf(f.uid), identifier: strOf(f.identifier), plan: strOf(f.plan), planLabel: strOf(f.planLabel) || strOf(f.plan),
+      days: f.days && f.days.integerValue != null ? Number(f.days.integerValue) : 0, createdAt: tsMs(f.createdAt) || 0,
+      validUntil: tsMs(f.validUntil) || 0, usedAt: tsMs(f.usedAt), usedBy: strOf(f.usedBy) };
+  }
+
+  async function loadCodes() {
+    var tk = await token();
+    var out = [], pageToken = '';
+    do {
+      var d = await request(FS + '/codes?pageSize=300' + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''), { headers: authHeaders(tk) });
+      (d.documents || []).forEach(function (doc) { out.push(parseCode(doc)); });
+      pageToken = d.nextPageToken || '';
+    } while (pageToken && out.length < 3000);
+    codes = out.sort(function (x, y) { return y.createdAt - x.createdAt; });
+  }
+
+  function codeState(c) {
+    if (c.usedAt) return { kind: 'used', text: 'Used on ' + fmtDay(c.usedAt) };
+    if (c.validUntil && c.validUntil < Date.now()) return { kind: 'expired', text: 'Expired unused (' + fmtDay(c.validUntil) + ')' };
+    return { kind: 'open', text: 'Not used yet · valid until ' + fmtDay(c.validUntil) };
+  }
+
+  function renderCodes() {
+    var box = el('entCodesList');
+    if (!box) return;
+    box.textContent = '';
+    if (!codes.length) { box.textContent = 'No codes yet.'; return; }
+    codes.slice(0, 60).forEach(function (c) {
+      var st = codeState(c);
+      var row = document.createElement('div');
+      row.className = 'ent-code-row';
+      row.setAttribute('data-code', c.code);
+      row.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:8px 10px;border:1px solid var(--border);border-radius:10px;margin-bottom:6px;font-size:0.84rem;';
+      var code = document.createElement('b'); code.setAttribute('dir', 'ltr'); code.style.fontFamily = 'ui-monospace,Menlo,Consolas,monospace'; code.textContent = formatCode(c.code);
+      var who = document.createElement('span'); who.textContent = c.identifier + ' · ' + c.planLabel;
+      var state = document.createElement('span');
+      state.style.color = st.kind === 'used' ? 'var(--success,#16a34a)' : st.kind === 'expired' ? 'var(--text-muted)' : 'var(--primary)';
+      state.textContent = st.text;
+      row.appendChild(code); row.appendChild(who); row.appendChild(state);
+      if (st.kind === 'open') {
+        var rv = document.createElement('button');
+        rv.type = 'button'; rv.className = 'btn btn-sm btn-outline'; rv.setAttribute('data-code-act', 'revoke'); rv.textContent = 'Revoke';
+        rv.style.marginInlineStart = 'auto';
+        row.appendChild(rv);
+      }
+      box.appendChild(row);
+    });
+  }
+
+  async function onCodeAction(e) {
+    var btn = e.target.closest && e.target.closest('button[data-code-act]');
+    if (!btn) return;
+    if (typeof RBAC !== 'undefined' && !RBAC.requireAdmin()) return;
+    var code = btn.closest('.ent-code-row').getAttribute('data-code');
+    if (!window.confirm('Revoke code ' + formatCode(code) + '? It will stop working.')) return;
+    btn.disabled = true;
+    try {
+      var tk = await token();
+      await request(FS + '/codes/' + encodeURIComponent(code), { method: 'DELETE', headers: authHeaders(tk) });
+      codes = codes.filter(function (c) { return c.code !== code; });
+      renderCodes();
+    } catch (err) { btn.disabled = false; acctMsg('Could not revoke the code: ' + friendly(err), true); }
+  }
+
+  /* ------------------------------------------------------------------ online payments (written by the payment Worker) */
+
+  var payments = [];
+  var PAY_STATES = {
+    Activated: ['Activated', 'var(--success,#16a34a)'], Paid: ['Paid, activation pending', 'var(--warning,#b45309)'],
+    Activating: ['Activating...', 'var(--primary)'], Created: ['Payment page opened, not paid', 'var(--text-muted)'],
+    AmountMismatch: ['Amount mismatch: not activated', 'var(--danger,#dc2626)'], LinkFailed: ['Wayl refused the link', 'var(--danger,#dc2626)']
+  };
+
+  function parsePayment(doc) {
+    var f = doc.fields || {};
+    return { ref: doc.name.split('/').pop(), uid: strOf(f.uid), identifier: strOf(f.identifier) || strOf(f.uid), planLabel: strOf(f.planLabel) || strOf(f.plan),
+      amount: f.amount && f.amount.integerValue != null ? Number(f.amount.integerValue) : 0, status: strOf(f.status), waylStatus: strOf(f.waylStatus),
+      env: strOf(f.env), method: strOf(f.paymentMethod), createdAt: tsMs(f.createdAt) || 0, activatedAt: tsMs(f.activatedAt), error: strOf(f.error) };
+  }
+
+  async function loadPayments() {
+    var tk = await token();
+    var out = [], pageToken = '';
+    do {
+      var d = await request(FS + '/payments?pageSize=300' + (pageToken ? '&pageToken=' + encodeURIComponent(pageToken) : ''), { headers: authHeaders(tk) });
+      (d.documents || []).forEach(function (doc) { out.push(parsePayment(doc)); });
+      pageToken = d.nextPageToken || '';
+    } while (pageToken && out.length < 3000);
+    payments = out.sort(function (x, y) { return y.createdAt - x.createdAt; });
+  }
+
+  function renderPayments() {
+    var box = el('entPaymentsList');
+    if (!box) return;
+    box.textContent = '';
+    if (!payments.length) { box.textContent = 'No online payments yet.'; return; }
+    var since = Date.now() - 30 * 86400000, total = 0, count = 0;
+    payments.forEach(function (p) { if (p.status === 'Activated' && p.env === 'live' && p.activatedAt >= since) { total += p.amount; count++; } });
+    var sum = document.createElement('div');
+    sum.style.cssText = 'font-size:0.84rem;color:var(--text2);margin-bottom:8px;';
+    sum.textContent = 'Last 30 days (live): ' + count + ' activated payment(s), ' + total.toLocaleString('en-US') + ' IQD.';
+    box.appendChild(sum);
+    payments.slice(0, 80).forEach(function (p) {
+      var st = PAY_STATES[p.status] || [p.status || 'Unknown', 'var(--text2)'];
+      var row = document.createElement('div');
+      row.className = 'ent-pay-row';
+      row.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;padding:8px 10px;border:1px solid var(--border);border-radius:10px;margin-bottom:6px;font-size:0.84rem;';
+      var who = document.createElement('b'); who.textContent = p.identifier;
+      var what = document.createElement('span'); what.textContent = p.planLabel + ' · ' + p.amount.toLocaleString('en-US') + ' IQD' + (p.env === 'test' ? ' · TEST' : '');
+      var state = document.createElement('span'); state.style.color = st[1]; state.style.fontWeight = '600'; state.textContent = st[0];
+      var when = document.createElement('span'); when.style.color = 'var(--text-muted)';
+      when.textContent = fmtDay(p.createdAt) + (p.method ? ' · ' + p.method : '') + (p.error ? ' · ' + p.error : '');
+      var ref = document.createElement('code'); ref.setAttribute('dir', 'ltr'); ref.style.cssText = 'font-size:0.74rem;color:var(--text-muted);flex-basis:100%;'; ref.textContent = p.ref;
+      row.appendChild(who); row.appendChild(what); row.appendChild(state); row.appendChild(when); row.appendChild(ref);
+      box.appendChild(row);
+    });
   }
 
   /* ------------------------------------------------------------------ question reports */
@@ -1009,13 +1259,11 @@
   /* ------------------------------------------------------------------ access scope card + ENT migration checklist */
 
   function accessCardHTML() {
-    return '<div class="card"><div class="card-header">Subscription scope &amp; free trial</div>' +
+    return '<div class="card"><div class="card-header">Subscription scope</div>' +
       '<p style="font-size:0.85rem;color:var(--text2);">What does an active subscription unlock? This is enforced by the Firestore rules, not just by the app.</p>' +
       '<label style="display:flex;gap:8px;align-items:flex-start;margin:8px 0;"><input type="radio" name="entScope" value="selected"> <span><b>The student\'s own specialty only</b> (recommended). A student of Dermatology downloads only the Dermatology bank.</span></label>' +
       '<label style="display:flex;gap:8px;align-items:flex-start;margin:8px 0;"><input type="radio" name="entScope" value="all"> <span><b>All specialties.</b> Any active subscriber may download every active specialty\'s bank. The app still only shows the student\'s own specialty.</span></label>' +
-      '<label class="modal-field" style="display:block;margin:14px 0 4px;"><b>Free trial for new students (days)</b>' +
-      '<input type="number" id="entTrialDays" min="0" max="365" step="1" inputmode="numeric" style="margin-top:6px;" aria-describedby="entTrialHelp"></label>' +
-      '<p id="entTrialHelp" style="font-size:0.8rem;color:var(--text2);margin:0 0 10px;">A new account gets the full app for this many days, counted from the moment it is created on the server. Afterwards only the questions you mark <b>Free</b> (100-250 recommended) stay open until you activate a subscription. Use 0 for no trial. Existing accounts keep their own dates; use End trial / Start trial in Student accounts for one student.</p>' +
+      '<p style="font-size:0.8rem;color:var(--text2);margin:10px 0;">There is no free trial: a new account starts on the free version, which opens only the questions you mark <b>Free</b> (up to 250 per specialty, published with Export Free Pack).</p>' +
       '<button class="btn btn-outline btn-block" id="btnScopeSave">Save</button>' +
       '<div id="entScopeMsg" style="margin-top:8px;font-size:0.82rem;color:var(--text2);"></div></div>';
   }
@@ -1031,24 +1279,18 @@
     var save2 = el('btnScopeSave');
     if (!save2) return;
     var radios = document.querySelectorAll('input[name="entScope"]');
-    var daysInput = el('entTrialDays');
     try {
       var current = await readAccess();
       Array.prototype.forEach.call(radios, function (r) { r.checked = r.value === current.scope; });
-      if (daysInput) daysInput.value = String(current.trialDays);
     } catch (e) { scopeMsg('Could not read the current settings: ' + friendly(e), true); }
     save2.addEventListener('click', async function () {
       if (typeof RBAC !== 'undefined' && !RBAC.requireAdmin()) return;
       var chosen = Array.prototype.filter.call(radios, function (r) { return r.checked; })[0];
       if (!chosen) return scopeMsg('Choose one option.', true);
-      var raw = daysInput ? String(daysInput.value).trim() : '';
-      var days = raw === '' ? null : Number(raw);
-      if (days !== null && (!isFinite(days) || days < 0 || days > 365 || Math.floor(days) !== days)) return scopeMsg('The trial length must be a whole number of days from 0 to 365.', true);
       save2.disabled = true;
       try {
-        await writeScope(chosen.value, days === null ? undefined : days);
-        scopeMsg('Saved: ' + (chosen.value === 'all' ? 'subscriptions cover all specialties' : 'subscriptions cover the student\'s own specialty') +
-          (days === null ? '.' : '; ' + (days === 0 ? 'no free trial for new students.' : 'new students get a ' + days + '-day free trial.')));
+        await writeScope(chosen.value, 0);
+        scopeMsg('Saved: ' + (chosen.value === 'all' ? 'subscriptions cover all specialties.' : 'subscriptions cover the student\'s own specialty.'));
       }
       catch (e) { scopeMsg('Could not save: ' + friendly(e), true); }
       finally { save2.disabled = false; }
@@ -1083,7 +1325,7 @@
     } else {
       row(false, 'Student accounts not loaded yet → tap "Load accounts" to count the ones without a specialty.');
     }
-    row(true, 'Subscription scope: ' + (scope === 'all' ? 'all specialties' : 'the student\'s own specialty') + '. Free trial for new students: ' + (accessSettings.trialDays === 0 ? 'off' : accessSettings.trialDays + ' day(s)') + '.');
+    row(true, 'Subscription scope: ' + (scope === 'all' ? 'all specialties' : 'the student\'s own specialty') + '. New students start on the free version (no trial).');
     box.innerHTML = rows.join('');
   }
 

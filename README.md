@@ -52,30 +52,28 @@ Questions keep their creation order inside a section; move a question with *Recl
   A v1 package without a specialty is treated as ENT.
 * Backups record their specialty and refuse to restore into another one.
 
-**Free questions.** Mark questions *Free* in the Questions list (the counter shows `N / 250`; **100–250 recommended, 250 is the
-hard limit**: the 251st cannot be marked and a free pack with more than 250 is not exported). Then Settings →
-*Export <Specialty> Free Pack* and put the file in `free-packs/<specialtyId>.qbpkg` next to the Student app's `index.html`
-(ENT may also keep the old `free-pack.entpkg`). The Free marks also travel inside the published bank, so republish after you change them.
-These are the only questions a student keeps after the free trial, until they subscribe (see *Free trial* below).
+**Free questions = the free version.** There is no free trial (since 13 Nov 2026): a student without a subscription sees only the
+questions marked *Free*, 250 per specialty. In the Questions list press **Auto-select 250** (keeps what you marked and fills the rest,
+spread evenly over every category and section) or mark them one by one; **Clear all Free** starts over. The counter shows `N / 250`;
+250 is the hard limit. Then Settings → *Export <Specialty> Free Pack* and put the file in `free-packs/<specialtyId>.qbpkg` next to the
+Student app's `index.html` (ENT may also keep the old `free-pack.entpkg`). The Free marks also travel inside the published bank, so
+republish after you change them.
 
 **Cloud publishing** (Settings → *Cloud (Firebase)*): sign in with your admin e-mail, open the specialty, press
 *Publish <Specialty> question bank*. The confirm dialog names the specialty. It writes `packs/<specialtyId>` and refuses to
 overwrite a pack that belongs to another specialty (`CROSS_SPECIALTY`). For ENT you can also refresh the old
 `packs/main` copy so students still on 1.3.x keep working.
 
-**Subscription scope & free trial** (Settings → *Subscription scope & free trial*): `selected` (default) — a subscriber reads only the bank of the
-specialty on their account; `all` — an active subscription opens every active specialty. Below it, **Free trial for new students (days)**
-(default 5, `0` = no trial). Enforced by the rules, not just the UI.
+**Subscription scope** (Settings → *Subscription scope*): `selected` (default) — a subscriber reads only the bank of the specialty on
+their account; `all` — an active subscription opens every active specialty. Enforced by the rules, not just the UI.
 
-**Free trial.** Every new student account gets the full app for `trialDays` days, counted from the moment the account is created
-(the time is written by the Firebase server, not by the phone). When the trial ends the student keeps their progress but only
-sees the questions you marked *Free* until you activate a subscription. During the trial the student downloads the full bank
-(the rules treat a running trial like a paid plan). Existing accounts are not given a new trial: an account older than the trial length
-simply has none; an account without a creation time (created by a very old version) has none. For one student use
-*Student accounts → Start trial* (N days from today) or *End trial*; *Stop* ends both the subscription and the trial.
+**Subscriptions and payments.** Students subscribe from the app: **Pay online** (Wayl, through the payment Worker in `wayl-worker/`,
+which activates the account automatically), **WhatsApp** (you agree on payment, then activate the account or send an activation code),
+or an **activation code**. *Student accounts → Online payments* lists the Worker's payments (Activated, Paid = activation pending,
+AmountMismatch = not activated, check Wayl) with the last 30 days' live total. Prices live in the Worker's `PLANS` setting.
 
-**Student accounts** (Settings → *Student accounts*): shows each student's specialty and access (Active / Free trial N days left / Expired / Free),
-filters by specialty, extends or stops a subscription, starts or ends a free trial, changes a student's specialty, approves/declines a student's change request, and (for the migration)
+**Student accounts** (Settings → *Student accounts*): shows each student's specialty and access (Active / Expired / Free version),
+filters by specialty, extends or stops a subscription, changes a student's specialty, approves/declines a student's change request, and (for the migration)
 *Assign the N account(s) with no specialty to ENT*.
 
 **Reports** (Settings → *Question reports*): each report shows its specialty; filter by specialty; *Show question* jumps to the
@@ -84,6 +82,22 @@ right workspace.
 **Admin mode and the passcode.** Version 1.3.0 shipped a fixed password inside `app.js`. It was removed. The first time you
 unlock Admin mode the app asks you to choose a passcode (at least 8 characters) for that device; only a salted PBKDF2 hash is
 stored. This only hides the admin screens on the device. The real protection is the Firestore rules plus `admins/{uid}`.
+
+### Activation codes (Admin app)
+Settings → *Student accounts* → *Load accounts* → **Activation code** on a row: choose the plan (1 month = 30 days, 3 months = 90, 12 months = 365) and
+how long the code stays usable (3/7/30 days) → *Create code*. The code (`XXXX-XXXX-XX`) is shown with **Send on WhatsApp to <the student's number>**
+(a ready Arabic + English message with the code, plan and account) and *Copy message*. The student enters it in the app (Settings → Access → Enter activation code) and full access starts at once;
+the row then shows *Last activation code used*. *Show recent codes* lists codes (not used / used / expired) and lets you **Revoke** an unused one.
+Codes live in Firestore `codes/{code}`; only an admin can create, list or delete them. You can still use +1/+3/+12 months and Set date as before.
+
+### Importing an old-format package (.entpkg) into a new specialty
+A package made by Adam ENT 1.3.x, or by a tool/AI following the old format, has no specialty (schema 1) and therefore counts as ENT. Importing it
+into another workspace (e.g. Obstetrics & Gynecology) now asks: *Import it into "<this specialty>"?* OK stamps every item with the open specialty
+and turns its `{category: [sections]}` map into this specialty's category tree; Cancel leaves everything untouched. Then export a `.qbpkg` from that
+workspace and publish it. The importer also accepts a package zipped as a folder, JSON files with a BOM, and AI-style question shapes (nested
+`options` objects/arrays, `question`/`stem`, `answer: "B"` / `"Option B"` / the option text, `category`/`section`); an incomplete question is
+reported by number, uid and text. The **Classification Guide** now also documents the exact `.qbpkg` format (`packageFormat`), so attach it when
+asking an AI to build a package.
 
 ### Students' mobile numbers (Admin app)
 Settings → *Student accounts* → *Load accounts*: each account shows its mobile number (`0770 123 4567`) and a green **WhatsApp** button that opens a chat
@@ -109,11 +123,12 @@ archived (read-only) specialty.
   approves it (or changes it directly), the page reloads into the other scope, and the old scope's data stays untouched.
 * A specialty that is inactive, archived or deleted shows a clear "unavailable" screen. The student is not moved and nothing
   is deleted; the bank returns as soon as the specialty is active again.
-* Free trial: right after registration the student has the full app for the trial length (a bar shows the days left and a *Subscribe*
-  button). Afterwards only the Free questions stay open; progress, bookmarks and notes are kept and everything returns when a plan is activated.
+* Free version: right after registration the student has the Free questions (up to 250) and a bar with a *Subscribe* button that lists the
+  plans with prices and offers Pay online (Wayl), WhatsApp and an activation code. When a plan ends, progress, bookmarks and notes are kept and
+  everything returns when it is renewed.
 * Works offline after the first sign-in, as before.
-* Google Play: the student app can be published as an Android app (see the separate `Adam-QBank-GooglePlay-Kit`). It adds in-app **Delete account**,
-  public privacy / terms / delete-account pages and a "Play mode" that hides every Subscribe / WhatsApp / payment prompt inside the Play build.
+* The student app is a website/PWA (adamqbank.com) with in-app **Delete account** and public privacy / terms / delete-account pages. It is not
+  published on Google Play (the Play kit is kept but unused).
   This needs the current `firebase/firestore.rules` (students may delete their own account document and reports). Read the kit's
   `PAYMENTS-AND-POLICY-NOTES.md` before deciding to publish a subscription app on Play.
 
@@ -144,15 +159,17 @@ tree. Any failure rejects the **whole** package before anything is written. ENT 
 | Path | Content | Who writes |
 |---|---|---|
 | `specialties/{id}` | id, name, description, status, sortOrder, schemaVersion | admin |
-| `users/{uid}` | identifier, plan, expiresAt, `createdAt` (server time = trial start), **specialtyId**, specialtyName, specialtyAssignedBy, specialtyChangeRequest, admin-only `trialEndsAt`, `trialStopped` | student creates own (plan `none`, active specialty, `createdAt` = server time); student may only add a change request; admin does the rest |
+| `users/{uid}` | identifier, plan, expiresAt, `createdAt` (server time), **specialtyId**, specialtyName, specialtyAssignedBy, specialtyChangeRequest | student creates own (plan `none`, active specialty, `createdAt` = server time); student may only add a change request; admin does the rest |
 | `packs/{specialtyId}` + `/chunks/*` | published bank | admin |
 | `packs/main` | legacy ENT copy | admin |
-| `settings/access` | `subscriptionScope` = `selected` \| `all`; `trialDays` (integer 0–365, default 5) | admin |
+| `settings/access` | `subscriptionScope` = `selected` \| `all`; `trialDays` (unused since 13 Nov 2026, saved as 0) | admin |
 | `reports/{uid}_{questionUid}` | report with `specialtyId` | student creates (own specialty only), admin reads |
+| `codes/{code}` | uid, plan, days, validUntil, usedAt, usedBy | admin creates; the student marks their own code used while redeeming |
+| `payments/{referenceId}` | uid, identifier, plan, days, amount, status (Created / Activating / Activated / Paid / AmountMismatch / LinkFailed), env, paymentMethod, dates | the payment Worker (signs in as a service admin); admin reads |
 | `admins/{uid}` | membership marker | you, in the console |
 
 The rules in `firebase/firestore.rules` enforce: a student reads only the pack of their own specialty (unless scope is `all`),
-only while the subscription is active **or the free trial is running** and the specialty is `active`; students cannot change their plan, expiry or specialty;
+only while the subscription is active and the specialty is `active`; students cannot change their plan, expiry or specialty;
 reports must carry the student's own specialty; only admins publish and manage.
 
 ## 6. What needs the owner
@@ -168,11 +185,9 @@ once to publish. Nothing in these zips can do that for you.
 
 * The security rules were written together with an automated test (`firebase/firestore-rules.test.js`) but that test needs the
   Firestore emulator, which could not be started where the code was produced. **Run `npm test` in `firebase/` before you publish the rules.**
-* **The free trial is a convenience, not copy protection.** The server decides who may download the bank, but a student whose bank is already on the
-  phone could set the phone's clock back, and someone can register a second account to get another trial. Switch the trial off (`0` days) if that matters more
-  than the conversion benefit. The free pack is a public static file by design.
-* **Rules must be republished** (and re-tested) when you move from the first 1.4.0 build to this one: they now know about `trialDays`, `createdAt` and the
-  admin-only trial fields. Accounts created by 1.3.x can still read; they have no trial.
+* **Offline grace is a convenience, not copy protection.** The server decides who may download the bank, but a student whose bank is already on the
+  phone keeps it for `offlineGraceDays` without checking. The free pack is a public static file by design.
+* **Rules must be republished** (and re-tested) for this build: the paid bank needs a paid, unexpired plan (no trial) and `payments/*` is admin-only.
 * Reordering is available for specialties, categories and sections. Questions keep their creation order.
 * A browser-side check (headless Chromium with a mocked Firebase) covered registration, isolation, switching, blocked states,
   package gates, publishing, migration from 1.3.0 and offline reload. It does not replace a trial against your real project.

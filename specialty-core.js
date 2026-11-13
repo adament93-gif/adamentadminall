@@ -288,6 +288,19 @@
       return { ok: false, identity: identity, errors: ['No specialty is selected, so this package cannot be applied.'], itemErrors: [] };
     }
     var errors = [];
+    if (identity.legacy && identity.specialtyId !== expectedSpecialtyId) {
+      // An old-format package (Adam ENT 1.3.x / schema 1) carries no specialty. The ADMINISTRATOR may adopt it into the open
+      // workspace (opts.adoptLegacy, asked for explicitly); every item is then stamped with that specialty by the importer.
+      // Students never adopt: their packages come from the administrator and must name the specialty.
+      if (opts.adoptLegacy) {
+        identity = { schema: identity.schema, specialtyId: expectedSpecialtyId, specialtyName: opts.expectedSpecialtyName || expectedSpecialtyId, legacy: true, adopted: true };
+      } else {
+        var expectedLabel = opts.expectedSpecialtyName ? '"' + opts.expectedSpecialtyName + '" (' + expectedSpecialtyId + ')' : '"' + expectedSpecialtyId + '"';
+        return { ok: false, identity: identity, legacyMismatch: true, itemErrors: [], errors: [
+          'This file is in the old Adam ENT format (schema 1) and does not say which specialty it belongs to, so it counts as an ENT package, but this ' +
+          (opts.subject || 'account') + ' is set to ' + expectedLabel + '. Nothing was imported.'] };
+      }
+    }
     if (identity.specialtyId !== expectedSpecialtyId) {
       var expectedName = opts.expectedSpecialtyName ? ' (' + opts.expectedSpecialtyName + ')' : '';
       errors.push('This package is for "' + identity.specialtyName + '" (' + identity.specialtyId + ') but this ' + (opts.subject || 'account') +

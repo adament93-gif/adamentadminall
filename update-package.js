@@ -463,7 +463,7 @@
         const name = (file.name || '').toLowerCase();
         if (name.endsWith('.json')) {
             let text, flat;
-            try { text = await file.text(); flat = JSON.parse(text); }
+            try { text = await file.text(); if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1); flat = JSON.parse(text); }
             catch (e) { throw new Error("This .json file isn't valid JSON (" + e.message + ")."); }
             if (!flat || typeof flat !== 'object' || !flat.manifest || !flat.database) {
                 throw new Error('This .json file is missing a "manifest" and/or "database" section, so it doesn\'t look like an update package.');
@@ -481,23 +481,38 @@
             throw new Error("Couldn't open this file as a zip/.entpkg package (" + e.message + ").");
         }
 
-        const manifestEntry = zip.file('manifest.json');
-        const databaseEntry = zip.file('database.json');
+        // The two files normally sit at the root. A package zipped as a FOLDER ("MyPackage/manifest.json") is accepted
+        // too: the shallowest folder that holds both files is used as the package root (assets are read relative to it).
+        const findRoot = () => {
+            const names = Object.keys(zip.files).filter(n => !zip.files[n].dir);
+            const roots = names.filter(n => /(^|\/)manifest\.json$/.test(n) && !/(^|\/)__MACOSX\//.test(n))
+                .map(n => n.slice(0, n.length - 'manifest.json'.length))
+                .filter(root => zip.file(root + 'database.json'))
+                .sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
+            return roots.length ? roots[0] : null;
+        };
+        const root = findRoot();
+        const manifestEntry = root != null ? zip.file(root + 'manifest.json') : null;
+        const databaseEntry = root != null ? zip.file(root + 'database.json') : null;
         if (!manifestEntry || !databaseEntry) {
-            throw new Error('This package is missing manifest.json and/or database.json, so it doesn\'t look like a valid .entpkg/.zip update package.');
+            throw new Error('This package is missing manifest.json and/or database.json, so it doesn\'t look like a valid .qbpkg/.entpkg/.zip update package.');
         }
 
+        const stripBom = t => (t && t.charCodeAt(0) === 0xFEFF ? t.slice(1) : t);
         let manifest, database, databaseRawText;
-        try { manifest = JSON.parse(await manifestEntry.async('string')); }
+        try { manifest = JSON.parse(stripBom(await manifestEntry.async('string'))); }
         catch (e) { throw new Error('manifest.json inside the package is not valid JSON (' + e.message + ').'); }
-        try { databaseRawText = await databaseEntry.async('string'); database = JSON.parse(databaseRawText); }
+        try { databaseRawText = stripBom(await databaseEntry.async('string')); database = JSON.parse(databaseRawText); }
         catch (e) { throw new Error('database.json inside the package is not valid JSON (' + e.message + ').'); }
 
         const assets = new Map(); // relative path -> Blob
         const assetEntries = [];
-        zip.forEach((relPath, entry) => {
+        zip.forEach((fullPath, entry) => {
             if (entry.dir) return;
+            if (root && fullPath.indexOf(root) !== 0) return;      // outside the package folder
+            const relPath = root ? fullPath.slice(root.length) : fullPath;
             if (relPath === 'manifest.json' || relPath === 'database.json') return;
+            if (/(^|\/)__MACOSX\//.test(fullPath) || /(^|\/)\.DS_Store$/.test(fullPath)) return;
             assetEntries.push([relPath, entry]);
         });
         for (const [relPath, entry] of assetEntries) {
@@ -506,6 +521,99 @@
         }
 
         return { manifest, database, databaseRawText, assets };
+    }
+
+    // ---------------------------------------------------------------
+    // Question shape normalisation (packages written by other tools / an AI)
+    // ---------------------------------------------------------------
+    // The native shape is flat: questionText, optionA..optionE, correctAnswer ("A".."E"), explanation, subject, chapter,
+    // topic, subtopic. Packages produced by hand or by an AI often nest the options ({A:..} or ["..",".."]) or use other
+    // field names; those are mapped here so the importer accepts them. Nothing is guessed from the question text.
+    const LETTERS = ['A', 'B', 'C', 'D', 'E'];
+    const FIELD_ALIASES = {
+        questionText: ['question', 'text', 'stem', 'question_text', 'questiontext'],
+        explanation: ['rationale', 'explain', 'answer_explanation', 'explanationText'],
+        subject: ['category', 'Category', 'Subject'],
+        chapter: ['section', 'Section', 'Chapter'],
+        topic: ['Topic'], subtopic: ['sub_topic', 'subTopic', 'Subtopic'],
+        book: ['source', 'Book', 'reference_book'],
+        difficulty: ['Difficulty', 'level']
+    };
+    function normalizeQuestionShape(q) {
+        if (!q || typeof q !== 'object' || Array.isArray(q)) return q;
+        const out = { ...q };
+        for (const [canon, aliases] of Object.entries(FIELD_ALIASES)) {
+            if (out[canon] == null || out[canon] === '') {
+                const hit = aliases.find(a => out[a] != null && out[a] !== '');
+                if (hit) { out[canon] = out[hit]; delete out[hit]; }
+            }
+        }
+        // options: {A: '..', b: '..'} | ['..', '..'] | [{label:'A', text:'..'}] | {optionA...} already flat
+        const nested = out.options ?? out.choices ?? out.answers ?? out.alternatives;
+        if (nested && typeof nested === 'object') {
+            const list = Array.isArray(nested) ? nested : null;
+            if (list) {
+                list.forEach((opt, i) => {
+                    if (i >= LETTERS.length) return;
+                    let letter = LETTERS[i], text = opt;
+                    if (opt && typeof opt === 'object') {
+                        const lbl = String(opt.label ?? opt.letter ?? opt.key ?? opt.id ?? '').trim().toUpperCase().replace(/[^A-E]/g, '');
+                        if (/^[A-E]$/.test(lbl)) letter = lbl;
+                        text = opt.text ?? opt.value ?? opt.option ?? opt.content ?? '';
+                    }
+                    if (out['option' + letter] == null && text != null && text !== '') out['option' + letter] = String(text);
+                });
+            } else {
+                for (const key of Object.keys(nested)) {
+                    const letter = String(key).trim().toUpperCase().replace(/^OPTION/, '').replace(/[^A-E]/g, '');
+                    if (/^[A-E]$/.test(letter) && out['option' + letter] == null && nested[key] != null && nested[key] !== '') out['option' + letter] = String(nested[key]);
+                }
+            }
+            delete out.options; delete out.choices; delete out.answers; delete out.alternatives;
+        }
+        for (const L of LETTERS) { // "optionA" variants: option_a, option a, a
+            if (out['option' + L] == null) {
+                const alt = ['option_' + L.toLowerCase(), 'option_' + L, 'option' + L.toLowerCase(), L, L.toLowerCase()].find(k => typeof out[k] === 'string' && out[k].trim());
+                if (alt) { out['option' + L] = out[alt]; delete out[alt]; }
+            }
+            if (typeof out['option' + L] === 'number') out['option' + L] = String(out['option' + L]);
+        }
+        // correct answer: "A" | "a" | "A." | "(B)" | "Option C" | the option's full text | correct/answer/correctOption aliases
+        let ans = out.correctAnswer ?? out.correct ?? out.answer ?? out.correct_answer ?? out.correctOption ?? out.key;
+        delete out.correct; delete out.answer; delete out.correct_answer; delete out.correctOption; delete out.key;
+        if (ans != null && typeof ans !== 'string') ans = String(ans);
+        if (typeof ans === 'string') {
+            const t = ans.trim();
+            const m = /^(?:option\s*)?\(?([A-Ea-e])\)?[.):]?$/i.exec(t);
+            if (m) ans = m[1].toUpperCase();
+            else {
+                const byText = LETTERS.find(L => typeof out['option' + L] === 'string' && normalizeText(out['option' + L]) === normalizeText(t));
+                if (byText) ans = byText;
+            }
+        }
+        if (ans != null) out.correctAnswer = ans;
+        if (typeof out.difficulty === 'string') {
+            const d = out.difficulty.trim().toLowerCase();
+            out.difficulty = d === 'easy' ? 'Easy' : d === 'medium' || d === 'moderate' ? 'Medium' : d === 'hard' || d === 'difficult' ? 'Hard' : out.difficulty;
+        }
+        return out;
+    }
+    function normalizeImportedQuestions(database) {
+        if (database && Array.isArray(database.questions)) database.questions = database.questions.map(normalizeQuestionShape);
+    }
+    // Error messages name the question (its number and the start of its text) so it can be found in the file.
+    function describeQuestion(q, index) {
+        const text = q && typeof q.questionText === 'string' ? q.questionText.trim().replace(/\s+/g, ' ') : '';
+        return 'Question ' + (index + 1) + (q && q.uid ? ' [' + String(q.uid).slice(0, 24) + ']' : '') + (text ? ' ("' + text.slice(0, 60) + (text.length > 60 ? '…' : '') + '")' : '');
+    }
+    function checkQuestions(questions) {
+        const problems = [];
+        (questions || []).forEach((q, i) => {
+            const errs = (!q || typeof q !== 'object' || Array.isArray(q)) ? ['not a question object']
+                : [].concat(typeof q.questionText === 'string' && q.questionText.trim() ? [] : ['Question text is required.'], validateQuestionAnswer(q));
+            if (errs.length) problems.push(describeQuestion(q, i) + ': ' + errs.join(' '));
+        });
+        return problems;
     }
 
     // ---------------------------------------------------------------
@@ -802,13 +910,15 @@
     // ---------------------------------------------------------------
     // Student-facing orchestration
     // ---------------------------------------------------------------
-    async function importUpdatePackage(file) {
+    async function importUpdatePackage(file, options) {
+        options = options || {};
         const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
         let parsed;
         try { parsed = await parsePackageFile(file); }
         catch (e) { return { success: false, stage: 'parse', message: e.message }; }
 
         const { manifest, database, databaseRawText, assets } = parsed;
+        normalizeImportedQuestions(database); // the checksum is verified on the raw text, so this never affects it
 
         const structural = validatePackageStructure(manifest, database);
         if (!structural.valid) return { success: false, stage: 'validate', message: structural.errors.join(' '), errors: structural.errors };
@@ -819,14 +929,21 @@
         if (!cur || !cur.id) return { success: false, stage: 'specialty', message: 'No specialty is selected, so this package cannot be applied. Nothing was changed.' };
         if (cur.blocked) return { success: false, stage: 'specialty', message: 'Your specialty is currently unavailable, so updates cannot be applied. Nothing was changed.' };
         if (cur.archived) return { success: false, stage: 'specialty', message: 'This specialty is archived and read-only, so nothing can be imported into it.' };
-        const gate = Core.validatePackageForSpecialty(manifest, database, cur.id, { expectedSpecialtyName: cur.name, subject: cur.subject });
-        if (!gate.ok) return { success: false, stage: 'specialty', message: gate.errors.join(' '), errors: gate.errors };
+        const gate = Core.validatePackageForSpecialty(manifest, database, cur.id, { expectedSpecialtyName: cur.name, subject: cur.subject, adoptLegacy: options.adoptLegacy === true });
+        if (!gate.ok) {
+            const counts = RECOGNIZED_CONTENT_KEYS.map(k => Array.isArray(database[k]) && database[k].length ? database[k].length + ' ' + k : '').filter(Boolean).join(', ');
+            return { success: false, stage: 'specialty', message: gate.errors.join(' '), errors: gate.errors,
+                     canAdoptLegacy: gate.legacyMismatch === true && cur.subject !== 'account', legacyCounts: counts, targetSpecialty: { id: cur.id, name: cur.name } };
+        }
 
         const checksumOk = await verifyChecksum(manifest, databaseRawText);
         if (!checksumOk) return { success: false, stage: 'checksum', message: "The package's checksum doesn't match its contents — it may be corrupted or was edited after export. Nothing was changed." };
 
-        try { prepareQuestionAnswers(database.questions || []); }
-        catch (questionError) { return { success: false, stage: 'questions', message: questionError.message }; }
+        const questionProblems = checkQuestions(database.questions || []);
+        if (questionProblems.length) {
+            return { success: false, stage: 'questions', errors: questionProblems.slice(0, 12),
+                     message: questionProblems.length + ' question(s) in this package are incomplete (every question needs its text, at least options A and B, and a correct answer letter A-E that has text). Nothing was changed.' };
+        }
 
         try { await U.validateQuestionImageAssets(manifest, database, assets); }
         catch (imageError) { return {success:false,stage:'images',message:imageError.message}; }
@@ -854,6 +971,12 @@
             catch (e) { stats.errors.push({ type: 'taxonomy', uid: null, reason: e.message }); }
         } else if (database.taxonomy && gate.identity.legacy) {
             try { taxonomyResult = await mergeTaxonomy(database.taxonomy); } catch (e) { /* non-fatal */ }
+            // An adopted old-format package: its {category: [sections]} map also becomes this specialty's own tree
+            // (the Categories screen and the exported .qbpkg use that tree, not the ENT baseline).
+            if (gate.identity.adopted && window.EntTaxonomy && window.EntTaxonomy.mergeLegacyMap) {
+                try { taxonomyV2Result = await window.EntTaxonomy.mergeLegacyMap(database.taxonomy); }
+                catch (e) { stats.errors.push({ type: 'taxonomy', uid: null, reason: e.message }); }
+            }
         }
 
         let newContentDbVersion = previousContentDbVersion;
@@ -883,7 +1006,8 @@
             added: stats.added, updated: stats.updated, skipped: stats.skipped, duplicates: stats.duplicates,
             imagesWritten: stats.imagesWritten || 0, received, noNewContent, message,
             errors: stats.errors, durationMs, warnings: compat.warnings, taxonomyResult, taxonomyV2Result, backupId,
-            specialtyId: cur.id, specialtyName: cur.name, packageSchema: gate.identity.schema
+            specialtyId: cur.id, specialtyName: cur.name, packageSchema: gate.identity.schema,
+            adoptedLegacy: gate.identity.adopted === true, targetSpecialty: { id: cur.id, name: cur.name }
         };
 
         const historyRaw = await db.getSetting(SETTINGS_KEYS.IMPORT_HISTORY, '[]');
@@ -1362,7 +1486,7 @@
           <button class="btn btn-accent btn-block mt-2" id="btnRunExportUpdate">${uiIcon("export")} Export ${esc(curSpec.name)} Package (.qbpkg)</button>
           <div id="exportUpdateResult" style="margin-top:12px;font-size:0.82rem;color:var(--text2);"></div>
           <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;">
-          <p style="font-size:0.85rem;color:var(--text2);"><b>Free version:</b> <b>${questionPublication.questions.filter(q => q.isFree === true).length}</b> question(s) are marked Free (recommended 100-250, maximum 250). A student whose free trial has ended sees only these until they subscribe. This exports only those, for <b>${esc(curSpec.name)}</b>, as <code>${esc(curSpec.id)}.qbpkg</code>. Put that file in the <code>free-packs/</code> folder next to <code>index.html</code> in the Student app before publishing it. Each specialty has its own free pack and only its own students download it.</p>
+          <p style="font-size:0.85rem;color:var(--text2);"><b>Free version:</b> <b>${questionPublication.questions.filter(q => q.isFree === true).length}</b> question(s) are marked Free (250 planned; Questions → <b>Auto-select 250</b> fills it up). This is the free version: a student without a subscription sees only these. This exports only those, for <b>${esc(curSpec.name)}</b>, as <code>${esc(curSpec.id)}.qbpkg</code>. Put that file in the <code>free-packs/</code> folder next to <code>index.html</code> in the Student app before publishing it. Each specialty has its own free pack and only its own students download it.</p>
           <button class="btn btn-outline btn-block" id="btnRunExportFree">${uiIcon("export")} Export ${esc(curSpec.name)} Free Pack (${esc(curSpec.id)}.qbpkg)</button>
           <div id="exportFreeResult" style="margin-top:12px;font-size:0.82rem;color:var(--text2);"></div>
         </div>`;
@@ -1451,7 +1575,18 @@
             importBtn.innerHTML = (uiIcon("clock") + " Validating…");
             resultBox.innerHTML = '';
             try {
-                const result = await importUpdatePackage(file);
+                let result = await importUpdatePackage(file);
+                if (!result.success && result.canAdoptLegacy) {
+                    const ok = window.confirm('This file is in the old Adam ENT format and does not say which specialty it belongs to.\n\n' +
+                        'Import it into "' + result.targetSpecialty.name + '" (' + result.targetSpecialty.id + ')?' +
+                        (result.legacyCounts ? '\nIt contains ' + result.legacyCounts + '.' : '') +
+                        '\n\nEvery item will be marked as "' + result.targetSpecialty.name + '" content. Choose Cancel if the file is really an ENT package.');
+                    if (ok) {
+                        importBtn.innerHTML = (uiIcon("clock") + " Importing…");
+                        result = await importUpdatePackage(file, { adoptLegacy: true });
+                        if (result.success) result.warnings = (result.warnings || []).concat(['Old-format package adopted into "' + result.targetSpecialty.name + '": its items were stamped with this specialty. Export a .qbpkg from this workspace to publish it.']);
+                    }
+                }
                 resultBox.innerHTML = renderImportResultHTML(result);
                 if (result.success) {
                     showToast(result.noNewContent ? (result.message || 'No new content in this package.') : `Update applied: +${result.added} added, ${result.updated} updated.`, result.noNewContent ? 'info' : 'success');
@@ -1536,7 +1671,7 @@
                     const FS = window.ENT_FREE_SAMPLE || { min: 100, max: 250 };
                     const freeCount = (await db.getAllQuestions()).filter(q => q.isFree === true).length;
                     if (freeCount > FS.max) throw new Error(freeCount + ' questions are marked Free but the limit is ' + FS.max + '. Unmark ' + (freeCount - FS.max) + ' first.');
-                    if (freeCount < FS.min && !window.confirm('Only ' + freeCount + ' question(s) are marked Free. Students whose trial has ended will see only these. ' + FS.min + '-' + FS.max + ' are recommended.\n\nExport anyway?')) {
+                    if (freeCount < FS.min && !window.confirm('Only ' + freeCount + ' question(s) are marked Free. Students without a subscription will see only these (' + FS.max + ' are planned; "Auto-select ' + FS.max + '" in Questions fills it up).\n\nExport anyway?')) {
                         resultBox.textContent = 'Export cancelled.';
                         return;
                     }

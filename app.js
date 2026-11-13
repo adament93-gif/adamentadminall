@@ -4489,7 +4489,7 @@ async function renderDashboard() {
             return `
             <div class="card">
               <div class="card-header">${uiIcon("questions")} Questions (${filtered.length})</div>
-              ${RBAC.isAdmin() ? `<div style="font-size:0.85rem;color:var(--text2);margin-bottom:8px;">Free sample (kept after the trial): <b id="freeCount">${freeCounterText(questions.filter(q => q.isFree === true).length)}</b></div>` : ''}
+              ${RBAC.isAdmin() ? `<div style="font-size:0.85rem;color:var(--text2);margin-bottom:8px;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;"><span>Free version (what students see without a subscription): <b id="freeCount">${freeCounterText(questions.filter(q => q.isFree === true).length)}</b></span><button type="button" class="btn btn-sm btn-outline" id="btnAutoFree" onclick="window.autoSelectFree()" title="Mark questions as Free until there are ${FREE_SAMPLE_MAX}, spread across every category and section">Auto-select ${FREE_SAMPLE_MAX}</button><button type="button" class="btn btn-sm btn-outline" id="btnClearFree" onclick="window.clearAllFree()">Clear all Free</button></div>` : ''}
               <div class="search-field">${uiIcon("search")}<input type="text" id="questionSearchInput" placeholder="Search questions, options, topics, books or references..." value="${escapeHTML(AppState.searchQuery)}"></div>
               <div class="form-row">
                 <div><select id="questionSubjectFilter"><option value="all">All Categories</option></select></div>
@@ -4542,15 +4542,56 @@ async function renderDashboard() {
         }
 
         // ---- Free sample (the questions that ship inside the free student app) ----
-        // What a student keeps once the free trial is over: only the questions marked Free. Recommended 100-250.
-        const FREE_SAMPLE_MIN = 100;
+        // The free version (no subscription, no trial since 13 Nov 2026): only the questions marked Free, 250 per specialty.
+        const FREE_SAMPLE_MIN = 250;
         const FREE_SAMPLE_MAX = 250;
         window.ENT_FREE_SAMPLE = { min: FREE_SAMPLE_MIN, max: FREE_SAMPLE_MAX };
         function freeCounterText(n) {
             if (n > FREE_SAMPLE_MAX) return n + ' / ' + FREE_SAMPLE_MAX + ' (over the limit: unmark ' + (n - FREE_SAMPLE_MAX) + ')';
-            if (n < FREE_SAMPLE_MIN) return n + ' / ' + FREE_SAMPLE_MAX + ' (recommended ' + FREE_SAMPLE_MIN + '-' + FREE_SAMPLE_MAX + ')';
-            return n + ' / ' + FREE_SAMPLE_MAX;
+            if (n < FREE_SAMPLE_MAX) return n + ' / ' + FREE_SAMPLE_MAX + ' (Auto-select fills it up)';
+            return n + ' / ' + FREE_SAMPLE_MAX + ' \u2713';
         }
+
+        // Fills the free version up to FREE_SAMPLE_MAX, keeping the questions already marked and spreading the new ones
+        // evenly over every category + section (round robin), so students sample the whole bank.
+        async function autoSelectFree() {
+            if (!RBAC.requireAdmin()) return;
+            const all = await db.getAllQuestions();
+            const already = all.filter(q => q.isFree === true).length;
+            const need = Math.min(FREE_SAMPLE_MAX - already, all.length - already);
+            if (need <= 0) { showToast(already >= FREE_SAMPLE_MAX ? 'The free version already has ' + FREE_SAMPLE_MAX + ' questions.' : 'Every question is already Free.', 'info'); return; }
+            const groups = new Map();
+            all.filter(q => q.isFree !== true).sort((a, b) => a.id - b.id).forEach(q => {
+                const key = (q.subject || '') + '\u0000' + (q.chapter || '');
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push(q);
+            });
+            const lists = [...groups.values()];
+            const pick = [];
+            for (let round = 0; pick.length < need; round++) {
+                let added = false;
+                for (const list of lists) {
+                    if (round < list.length) { pick.push(list[round]); added = true; if (pick.length >= need) break; }
+                }
+                if (!added) break;
+            }
+            if (!confirm('Mark ' + pick.length + ' more question(s) as Free, spread across ' + lists.length + ' section(s)?\n\nThe free version will then have ' + (already + pick.length) + ' questions. You can unmark any of them. Then use Export Free Pack and add the file to the Student app.')) return;
+            for (const q of pick) await db.updateQuestion(q.id, { isFree: true });
+            showToast(pick.length + ' question(s) marked Free. Now export the Free Pack (Settings → Free version).', 'success');
+            renderViewSafely(AppState.currentView);
+        }
+        window.autoSelectFree = autoSelectFree;
+
+        async function clearAllFree() {
+            if (!RBAC.requireAdmin()) return;
+            const marked = (await db.getAllQuestions()).filter(q => q.isFree === true);
+            if (!marked.length) { showToast('No question is marked Free.', 'info'); return; }
+            if (!confirm('Unmark all ' + marked.length + ' Free question(s)? Students without a subscription will see nothing until you mark questions again and export a new Free Pack.')) return;
+            for (const q of marked) await db.updateQuestion(q.id, { isFree: false });
+            showToast('All Free marks removed.', 'success');
+            renderViewSafely(AppState.currentView);
+        }
+        window.clearAllFree = clearAllFree;
         async function refreshFreeCounter() {
             const el = document.getElementById('freeCount');
             if (!el) return;
