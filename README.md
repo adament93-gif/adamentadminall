@@ -64,6 +64,19 @@ small differences (capitals, spaces, punctuation, &/and) are corrected automatic
 **Books and duplicates (15 Nov 2026).** A JSON book is imported in full: a question already present in **another** book is added for
 this book too (its own record and uid); only a repeat inside the **same** book (same text + same set of options) is skipped.
 Re-importing a book adds only what it is missing. *Remove Repeats Inside a Book* (admin dashboard) never deletes the copy in another book.
+
+**A book uploaded again under another name (16 Nov 2026).** The import preview has a **Book check**: when at least half of an
+uploaded book's questions are already in one stored book with a different name, it asks *same book?* and does not continue
+until answered. *Yes* saves the rows under the stored name (only the new questions are added); *No* imports it as its own book.
+A name that differs only in capitals, spacing or punctuation is saved under the stored spelling without asking.
+*Import → Books stored twice* lists pairs of books that look like one book (same name written differently, or at least half of
+the smaller book shared) and merges a pair into the name you choose (`db.mergeBooks`): a shared question is kept once (the oldest
+record stays, so its uid, Free mark and students' progress stay, and it takes the details of the latest upload); everything else
+moves to the chosen name. Publish afterwards (and Publish free version if the Free count changed).
+
+**Deletions reach students.** The published bank is the whole bank: after a subscriber installs it, questions that are no longer
+in it (a deleted book, a merged copy) are removed from the device (`removeDeletedQuestions` in the student `subscription.js`);
+answers, bookmarks, notes and High Yield marks made on a removed copy move to the copy of the same question that stays.
 Students see one copy outside book study (see the student README).
 
 **Free questions = the free version.** There is no free trial (since 13 Nov 2026): a student without a subscription sees only the

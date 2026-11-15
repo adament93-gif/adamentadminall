@@ -1579,10 +1579,17 @@
       var mirror = !!(mirrorBox && mirrorBox.checked);
       var scope = 'selected';
       try { scope = await readScope(); } catch (e) { /* shown below as the default */ }
+      // Students' devices follow the published bank exactly: what is not in it any more is removed there. A smaller bank
+      // than the published one is therefore pointed out, in case this device does not hold the whole bank.
+      var published = 0;
+      try { var lastMeta = await readMeta(await token(), cur.id); published = lastMeta && lastMeta.questions ? Number(lastMeta.questions) : 0; } catch (e) { published = 0; }
+      var fewer = published > count ? published - count : 0;
       var ok = window.confirm('Publish this specialty?\n\n' +
         '    ' + cur.name + '   (ID: ' + cur.id + ')\n' +
         '    ' + count + ' question(s) from this workspace\n\n' +
-        'It will REPLACE the bank that ' + cur.name + ' students download (packs/' + cur.id + (mirror ? ' and the old packs/main' : '') + '). The free version is not changed (it has its own Publish button). Other specialties are not touched.\n' +
+        (fewer ? 'ATTENTION: the bank published now has ' + published + ' question(s), this one has ' + count + '. The ' + fewer + ' question(s) that are no longer here will be REMOVED from students\' devices. ' +
+          'If you did not delete or merge them on purpose (for example this device does not hold your whole bank), press Cancel.\n\n' : '') +
+        'It will REPLACE the bank that ' + cur.name + ' students download (packs/' + cur.id + (mirror ? ' and the old packs/main' : '') + '): questions you deleted or merged disappear for students too. The free version is not changed (it has its own Publish button). Other specialties are not touched.\n' +
         'Subscription scope: ' + (scope === 'all' ? 'all specialties' : 'the student\'s own specialty') + '.\n\nContinue?');
       if (!ok) return;
       busy = true;

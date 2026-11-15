@@ -1676,6 +1676,65 @@ const LazyRenderer = {
                 });
             }
 
+            // Merges the book `fromName` into `intoName` (two names of the same book, e.g. a new version of a file uploaded
+            // under another name). Every question ends up in `intoName`. A question that is in both (same text and options)
+            // is kept ONCE: the oldest record stays, because students' answers and the Free mark hang on it, and it takes
+            // the details (answer, explanation, classification) of the newest copy, the latest upload. Lectures and book
+            // entries follow the name.
+            async mergeBooks(fromName, intoName) {
+                fromName = String(fromName == null ? '' : fromName).trim();
+                intoName = String(intoName == null ? '' : intoName).replace(/\s+/g, ' ').trim();
+                if (!fromName || !intoName) throw new Error('A book name cannot be empty.');
+                if (fromName === intoName) throw new Error('Choose two different books.');
+                await this.ensureReady();
+                const now = new Date().toISOString();
+                const result = { from: fromName, into: intoName, moved: 0, removed: 0, kept: 0, lectures: 0 };
+                await new Promise((resolve, reject) => {
+                    const tx = this.db.transaction(['questions', 'bookmarks', 'notes', 'highYield'], 'readwrite');
+                    tx.oncomplete = resolve;
+                    tx.onerror = () => reject(tx.error || new Error('The books could not be merged.'));
+                    tx.onabort = () => reject(tx.error || new Error('The books could not be merged. Nothing was changed.'));
+                    const store = tx.objectStore('questions');
+                    const all = store.getAll();
+                    all.onsuccess = () => {
+                        try {
+                            const bookOf = q => (typeof q.book === 'string' ? q.book.trim() : '');
+                            const pool = (all.result || []).filter(q => bookOf(q) === fromName || bookOf(q) === intoName).sort((a, b) => a.id - b.id);
+                            const groups = new Map();
+                            for (const q of pool) {
+                                const key = QuestionImport.dupKey(q) || ('id:' + q.id);
+                                if (!groups.has(key)) groups.set(key, []);
+                                groups.get(key).push(q);
+                            }
+                            for (const list of groups.values()) {
+                                const keep = list[0], newest = list[list.length - 1];
+                                let record = keep, changed = false;
+                                if (list.length > 1) {
+                                    record = Object.assign({}, newest, { id: keep.id, uid: keep.uid || newest.uid, dateAdded: keep.dateAdded || newest.dateAdded,
+                                        isFree: list.some(q => q.isFree === true) });
+                                    changed = true;
+                                    result.kept++;
+                                    for (const extra of list.slice(1)) {
+                                        store.delete(extra.id);
+                                        ['bookmarks', 'notes', 'highYield'].forEach(name => tx.objectStore(name).delete(extra.id));
+                                        result.removed++;
+                                    }
+                                }
+                                if (bookOf(record) !== intoName) { record.book = intoName; changed = true; if (list.length === 1) result.moved++; }
+                                if (typeof record.group === 'string' && record.group.trim() === fromName) { record.group = intoName; changed = true; }
+                                if (changed) { record.updatedAt = now; store.put(record); }
+                            }
+                        } catch (error) { tx.abort(); reject(error); }
+                    };
+                });
+                this._invalidateCache();
+                // Whatever else carries the old name (lectures, book entries, a group label) follows it.
+                const renamed = await ENTDatabase.prototype.renameBook.call(this, fromName, intoName);
+                result.lectures = renamed ? renamed.lectures : 0;
+                this._invalidateCache();
+                return result;
+            }
+
             async deleteQuestionsByBook(bookName) {
                 this._invalidateCache(['questions', 'groups', 'books', 'bookmarks', 'highYield']);
                 await this.ensureReady();
@@ -1955,6 +2014,7 @@ const db = new ENTDatabase();
             db.deleteQuestionsByGroup = wrapAdmin(db.deleteQuestionsByGroup, 'deleteQuestionsByGroup');
             db.deleteQuestionsByBook = wrapAdmin(db.deleteQuestionsByBook, 'deleteQuestionsByBook');
             db.renameBook = wrapAdmin(db.renameBook, 'renameBook');
+            db.mergeBooks = wrapAdmin(db.mergeBooks, 'mergeBooks');
             db.addLecture = wrapAdmin(db.addLecture, 'addLecture');
             db.deleteLecture = wrapAdmin(db.deleteLecture, 'deleteLecture');
             db.updateLecture = wrapAdmin(db.updateLecture, 'updateLecture');
@@ -4769,6 +4829,11 @@ async function renderDashboard() {
                 <div><label for="renameBookNew">New name</label><input type="text" id="renameBookNew" maxlength="120" placeholder="New book name" autocomplete="off"></div>
               </div>
               <button class="btn btn-primary mt-2" id="btnRenameBook">${uiIcon("edit")} Rename Book</button>
+              <hr style="margin:10px 0">
+              <div class="card-header" style="font-size:1rem;">${uiIcon("refresh")} Books stored twice</div>
+              <p style="font-size:0.85rem;color:var(--text2);margin-bottom:10px;">Finds a book that is stored under two names (for example a new version of a file uploaded with a different book name) and merges the two into one book. A question that is in both is kept once.</p>
+              <button class="btn btn-outline" id="btnFindSameBooks">${uiIcon("search")} Find books stored twice</button>
+              <div id="sameBooksArea" aria-live="polite" style="margin-top:10px;"></div>
             </div>
             <div class="card"><div class="card-header">${uiIcon("export")} Backup (Admin)</div>
               <button class="btn btn-accent" id="btnExport">${uiIcon("export")} Export All</button>
@@ -5272,13 +5337,47 @@ const QuestionImport = (() => {
 
     // The same MCQ may be in several books: a book is always imported in FULL, and only a repeat inside the SAME book is a
     // duplicate. Same question = same text and same set of options (case, spacing, punctuation and option order ignored).
-    function dupKey(q) {
-        if (!q) return '';
-        const text = normalizeText(q.questionText);
-        if (!text) return '';
-        const opts = ['A', 'B', 'C', 'D', 'E'].map(l => normalizeText(q['option' + l])).filter(Boolean).sort();
-        return text + '\u0001' + opts.join('\u0002');
+    // Comparing questions: a 128-bit fingerprint of the normalized text and options (case, accents, spacing, punctuation
+    // and the order of the options are ignored). Plain text is hashed in one pass, without building the normalized string,
+    // which makes comparing a large bank several times faster. Besides ASCII, the punctuation that medical text is full of
+    // (curly quotes, dashes, ellipsis, °, ±, ×, ≤, ≥, no-break space) is handled directly: like all punctuation, it only
+    // separates words. Any other character (accents, other scripts) sends the text through the full normalization first.
+    // Two different questions sharing the fingerprint of the text AND of the options is practically impossible.
+    let __dupH1 = 0, __dupH2 = 0;
+    function dupTextHash(value, normalize, ready) {
+        __dupH1 = __dupH2 = 0;
+        if (typeof value !== 'string' || !value) return false;
+        let h1 = 0xdeadbeef, h2 = 0x41c6ce57, gap = false, any = false;
+        for (let i = 0, n = value.length; i < n; i++) {
+            let c = value.charCodeAt(i);
+            if (!ready) {
+                if (c >= 97 && c <= 122) { /* a-z */ }
+                else if (c >= 65 && c <= 90) c += 32;
+                else if (c >= 48 && c <= 57) { /* 0-9 */ }
+                else if (c < 128 || c === 0xa0 || c === 0xb0 || c === 0xb1 || c === 0xd7 || (c >= 0x2010 && c <= 0x2027) || c === 0x2032 || c === 0x2033 || c === 0x2264 || c === 0x2265) { gap = any; continue; }
+                else return dupTextHash(normalize(value), normalize, true);
+                if (gap) { h1 = Math.imul(h1 ^ 32, 2654435761); h2 = Math.imul(h2 ^ 32, 1597334677); gap = false; }
+            }
+            any = true;
+            h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677);
+        }
+        if (!any) return false;
+        h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+        h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+        __dupH1 = h1; __dupH2 = h2;
+        return true;
     }
+    const DUP_OPTION_FIELDS = ['optionA', 'optionB', 'optionC', 'optionD', 'optionE'];
+    function dupQuestionKey(q, normalize) {
+        if (!q || !dupTextHash(q.questionText, normalize)) return '';
+        const a = __dupH1, b = __dupH2;
+        let c = 0, d = 0;       // the options are added up, so their order does not matter
+        for (let i = 0; i < 5; i++) {
+            if (dupTextHash(q[DUP_OPTION_FIELDS[i]], normalize)) { c = (c + __dupH1) | 0; d = (d + Math.imul(__dupH2 | 1, __dupH1 ^ 0x9e3779b9)) | 0; }
+        }
+        return String.fromCharCode(a & 65535, a >>> 16, b & 65535, b >>> 16, c & 65535, c >>> 16, d & 65535, d >>> 16);
+    }
+    function dupKey(q) { return dupQuestionKey(q, normalizeText); }
     function bookKey(q, groupName = '') { return normalizeText((q && q.book) || groupName || ''); }
     function sameBookKey(q, groupName = '') { const k = dupKey(q); return k ? bookKey(q, groupName) + '\u0000' + k : ''; }
 
@@ -5420,9 +5519,11 @@ const QuestionImport = (() => {
 
     /** Mutates and returns rows. Only a selected row reserves a within-file duplicate key. */
     function recheckRows(rows, existingQuestions = [], groupName = '') {
-        const existingText = new Map(), existingUid = new Map();
+        const existingText = new Map(), existingUid = new Map(), existingAny = new Set();
         for (const q of existingQuestions) {
-            const text = sameBookKey(q);
+            const anyBook = dupKey(q);
+            if (anyBook) existingAny.add(anyBook);
+            const text = anyBook ? bookKey(q) + '\u0000' + anyBook : '';
             const label = q.id == null ? 'existing question' : `question ${q.id}`;
             if (text) existingText.set(text, label + ' in the same book');
             if (typeof q.uid === 'string' && q.uid.trim()) existingUid.set(q.uid.trim(), { label, book: bookKey(q) });
@@ -5441,7 +5542,7 @@ const QuestionImport = (() => {
                 else if (text && fileText.has(text)) row.duplicateOf = { kind: 'file', label: `Repeated in this file (row ${fileText.get(text)})` };
                 else if (uid && fileUid.has(uid)) row.duplicateOf = { kind: 'file', label: `Repeated in this file (row ${fileUid.get(uid)})` };
                 // Also in ANOTHER book: imported anyway (students studying that book see it), shown once elsewhere.
-                if (!row.duplicateOf && (uidHit || existingQuestions.some(q => dupKey(q) && dupKey(q) === dupKey(row.question)))) row.otherBookCopy = true;
+                if (!row.duplicateOf && (uidHit || existingAny.has(dupKey(row.question)))) row.otherBookCopy = true;
             }
             if (row.errors.length || row.duplicateOf) row.selected = false;
             if (row.selected && !row.errors.length && !row.duplicateOf) {
@@ -5465,7 +5566,53 @@ const QuestionImport = (() => {
         return result;
     }
 
-    return { parse, parseCSV, normalizeText, dupKey, bookKey, sameBookKey, validateQuestion, prepareRows, recheckRows, summarize };
+    function bookNameOf(q) { return q && typeof q.book === 'string' ? q.book.replace(/\s+/g, ' ').trim() : ''; }
+
+    // Books of the file that are already stored under ANOTHER name:
+    //   kind 'name'    the name differs only in capitals, spacing or punctuation: it IS the same book;
+    //   kind 'content' at least half of the book's questions are already in one stored book: probably a new version of
+    //                  it, uploaded under a different name. The administrator decides (same book / different book).
+    function bookMatches(rows, existingQuestions = [], groupName = '') {
+        const existing = new Map();
+        for (const q of existingQuestions) {
+            const name = bookNameOf(q);
+            if (!name) continue;
+            let e = existing.get(name);
+            if (!e) existing.set(name, e = { name, norm: normalizeText(name), keys: new Set(), count: 0 });
+            e.count++;
+            const k = dupKey(q);
+            if (k) e.keys.add(k);
+        }
+        const incoming = new Map();
+        for (const row of rows) {
+            if (!row.question || (row.sourceErrors && row.sourceErrors.length)) continue;
+            const name = bookNameOf(row.question) || String(groupName || '').replace(/\s+/g, ' ').trim();
+            if (!name) continue;
+            let b = incoming.get(name);
+            if (!b) incoming.set(name, b = { name, norm: normalizeText(name), keys: new Set(), rowKeys: [] });
+            b.rowKeys.push(row.key);
+            const k = dupKey(row.question);
+            if (k) b.keys.add(k);
+        }
+        const out = [];
+        for (const b of incoming.values()) {
+            if (existing.has(b.name)) continue;                 // exactly this book: nothing to ask
+            const count = e => { let n = 0; for (const k of b.keys) if (e.keys.has(k)) n++; return n; };
+            const twin = b.norm ? [...existing.values()].find(e => e.norm === b.norm) : null;
+            if (twin) { out.push({ incoming: b.name, existing: twin.name, kind: 'name', total: b.keys.size, shared: count(twin), rowKeys: b.rowKeys }); continue; }
+            let best = null;
+            for (const e of existing.values()) {
+                const shared = count(e);
+                if (shared && (!best || shared > best.shared)) best = { e, shared };
+            }
+            if (best && best.shared >= 3 && best.shared * 2 >= b.keys.size) {
+                out.push({ incoming: b.name, existing: best.e.name, kind: 'content', total: b.keys.size, shared: best.shared, existingCount: best.e.count, rowKeys: b.rowKeys });
+            }
+        }
+        return out;
+    }
+
+    return { parse, parseCSV, normalizeText, dupKey, bookKey, sameBookKey, validateQuestion, prepareRows, recheckRows, summarize, bookMatches, bookNameOf };
 })();
 
 
@@ -5561,8 +5708,11 @@ async function beginQuestionImportPreview() {
             pageSize: 20,
             filter: 'all',
             step: 'preview',
-            busy: false
+            busy: false,
+            bookMatches: QuestionImport.bookMatches(rows, existingQuestions, groupName).map(m => Object.assign(m, { choice: null }))
         };
+        // The same name with other capitals, spacing or punctuation is the same book: it keeps the stored spelling.
+        ImportPreviewState.bookMatches.filter(m => m.kind === 'name').forEach(m => setImportBookChoice(ImportPreviewState, m, 'same'));
         renderQuestionImportPreview();
         document.getElementById('importPreviewArea').scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (error) {
@@ -5571,6 +5721,60 @@ async function beginQuestionImportPreview() {
         area.innerHTML = `<div class="card" role="alert"><div class="card-header">Import preview could not be prepared</div><p>${importPreviewEscape(error.message || error)}</p><p style="color:var(--text2);margin-top:8px;">Correct the source data and choose Preview Import again.</p></div>`;
         showToast('Preview error: ' + (error.message || error), 'error');
     }
+}
+
+// 'same': the rows of that book are saved under the stored book's name, so only its new questions are added.
+// 'separate' or null: the rows keep the name written in the file.
+function setImportBookChoice(state, match, choice) {
+    const keys = new Set(match.rowKeys);
+    for (const row of state.rows) {
+        if (!keys.has(row.key) || !row.question) continue;
+        if (row.bookBefore) {                       // undo an earlier 'same'
+            const before = row.bookBefore;
+            if (before.book === undefined) delete row.question.book; else row.question.book = before.book;
+            if (before.group === undefined) delete row.question.group; else row.question.group = before.group;
+            row.selected = before.selected;
+            delete row.bookBefore;
+        }
+        if (choice === 'same') {
+            row.bookBefore = { book: row.question.book, group: row.question.group, selected: row.selected };
+            const oldGroup = typeof row.question.group === 'string' ? row.question.group.trim() : '';
+            row.question.book = match.existing;
+            if (!oldGroup || oldGroup === match.incoming) row.question.group = match.existing;
+        }
+    }
+    match.choice = choice;
+    state.rows = QuestionImport.recheckRows(state.rows, state.existingQuestions, state.groupName);
+}
+
+function importBookBannerHTML(state, disabled) {
+    const matches = state.bookMatches || [];
+    if (!matches.length) return '';
+    const e = importPreviewEscape;
+    const open = matches.some(m => m.choice === null);
+    const items = matches.map((m, i) => {
+        const fresh = Math.max(0, m.total - m.shared);
+        if (m.kind === 'name') {
+            return `<div class="import-book-item"><p style="margin:0;"><strong>«${e(m.incoming)}»</strong> is your book <strong>«${e(m.existing)}»</strong> written a little differently (capitals, spaces or punctuation). Its questions are saved under <strong>«${e(m.existing)}»</strong>, so the book is not listed twice.</p></div>`;
+        }
+        if (m.choice === 'same') {
+            return `<div class="import-book-item"><p style="margin:0 0 6px;"><strong>Same book.</strong> «${e(m.incoming)}» is saved in your book <strong>«${e(m.existing)}»</strong>: ${fresh} new question(s) will be added, ${m.shared} are already there.</p>
+                <button type="button" class="btn btn-outline btn-sm" data-import-action="book-change" data-book-index="${i}" ${disabled}>Change</button></div>`;
+        }
+        if (m.choice === 'separate') {
+            return `<div class="import-book-item"><p style="margin:0 0 6px;"><strong>Different book.</strong> «${e(m.incoming)}» is imported as its own book with all ${m.total} question(s). ${m.shared} of them are also in «${e(m.existing)}»; students see those once outside book study.</p>
+                <button type="button" class="btn btn-outline btn-sm" data-import-action="book-change" data-book-index="${i}" ${disabled}>Change</button></div>`;
+        }
+        return `<div class="import-book-item"><p style="margin:0 0 6px;"><strong>«${e(m.incoming)}»</strong> looks like your book <strong>«${e(m.existing)}»</strong>: ${m.shared} of its ${m.total} question(s) are already in «${e(m.existing)}». Is it the same book?</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button type="button" class="btn btn-primary btn-sm" data-import-action="book-same" data-book-index="${i}" ${disabled}>Yes, same book: add only the ${fresh} new question(s) to «${e(m.existing)}»</button>
+              <button type="button" class="btn btn-outline btn-sm" data-import-action="book-separate" data-book-index="${i}" ${disabled}>No, a different book: import all ${m.total} as «${e(m.incoming)}»</button>
+            </div></div>`;
+    }).join('<hr style="margin:10px 0;border:0;border-top:1px solid var(--border);">');
+    return `<div class="card" style="border-color:${open ? 'var(--warning)' : 'var(--border)'};margin:0 0 12px;" id="importBookReport">
+        <div style="font-weight:700;margin-bottom:6px;">Book check — مطابقة الكتاب</div>
+        ${items}
+    </div>`;
 }
 
 function renderQuestionImportPreview() {
@@ -5663,6 +5867,7 @@ function renderQuestionImportPreview() {
         </tr>`;
     };
 
+    const bookOpen = (state.bookMatches || []).some(m => m.choice === null);
     const gaps = importTaxonomyGaps(state.rows);
     const alignedCount = state.rows.filter(row => row.aligned).length;
     const gapList = gaps.missing.slice(0, 12).map(g => `<li>${importPreviewEscape(g.subject)}${g.chapter ? ' › ' + importPreviewEscape(g.chapter) : ' <em>(new category' + (g.chapters.size ? ', ' + g.chapters.size + ' section(s)' : '') + ')</em>'} <span style="color:var(--text2);">— ${g.count} question(s)</span></li>`).join('');
@@ -5677,6 +5882,7 @@ function renderQuestionImportPreview() {
     area.innerHTML = `${importPreviewLayoutStyle()}<div class="card" id="questionImportPreviewCard" aria-busy="${busy}">
         <div class="card-header">Question Import Preview — معاينة الاستيراد</div>
         <p style="color:var(--text2);">Review the questions, exclude rows and edit classifications. Changes on this screen are saved only after Confirm Import.</p>
+        ${importBookBannerHTML(state, disabled)}
         ${taxBanner}
         ${progress}
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
@@ -5698,9 +5904,10 @@ function renderQuestionImportPreview() {
             <button type="button" class="btn btn-outline btn-sm" data-import-action="next" ${busy || state.page + 1 >= pageCount ? 'disabled' : ''}>Next</button>
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:16px;">
-            <button type="button" class="btn btn-primary" id="btnPrepareImportConfirm" ${busy || !selectedRows.length ? 'disabled' : ''}>Review Import Summary (${selectedRows.length})</button>
+            <button type="button" class="btn btn-primary" id="btnPrepareImportConfirm" ${busy || !selectedRows.length || bookOpen ? 'disabled' : ''}>Review Import Summary (${selectedRows.length})</button>
             <button type="button" class="btn btn-outline" id="btnCancelImportPreview" ${disabled}>Cancel Preview</button>
         </div>
+        ${bookOpen ? '<p id="importBookHint" style="margin-top:8px;color:var(--warning);font-size:0.88rem;">Answer the question in “Book check” at the top first.</p>' : ''}
     </div>`;
     area.onchange = event => {
         if (!ImportPreviewState || ImportPreviewState.busy) return;
@@ -5725,6 +5932,15 @@ function renderQuestionImportPreview() {
         const action = button.dataset.importAction;
         if (action === 'edit') { editImportPreviewClassification(Number(button.dataset.importKey)); return; }
         if (action === 'add-missing-tax') { addImportGapsToTaxonomy(); return; }
+        if (action === 'book-same' || action === 'book-separate' || action === 'book-change') {
+            const match = (ImportPreviewState.bookMatches || [])[Number(button.dataset.bookIndex)];
+            if (match && match.kind === 'content') {
+                setImportBookChoice(ImportPreviewState, match, action === 'book-same' ? 'same' : action === 'book-separate' ? 'separate' : null);
+                ImportPreviewState.page = 0;
+            }
+            renderQuestionImportPreview();
+            return;
+        }
         if (action === 'previous') ImportPreviewState.page--;
         if (action === 'next') ImportPreviewState.page++;
         if (action === 'select-visible' || action === 'exclude-visible') {
@@ -5738,6 +5954,7 @@ function renderQuestionImportPreview() {
     };
     document.getElementById('btnPrepareImportConfirm').onclick = () => {
         if (!ImportPreviewState || ImportPreviewState.busy) return;
+        if ((ImportPreviewState.bookMatches || []).some(m => m.choice === null)) return;
         ImportPreviewState.step = 'confirm';
         renderQuestionImportPreview();
         document.getElementById('importConfirmationCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -6349,6 +6566,9 @@ async function confirmQuestionImport() {
                 renderViewSafely('import');
             });
 
+            const sameBooksBtn = $('#btnFindSameBooks');
+            if (sameBooksBtn) sameBooksBtn.addEventListener('click', () => { if (RBAC.requireAdmin()) renderBooksStoredTwice(); });
+
             const renameBookBtn = $('#btnRenameBook');
             if (renameBookBtn) renameBookBtn.addEventListener('click', async () => {
                 if (!RBAC.requireAdmin()) return;
@@ -6654,6 +6874,85 @@ async function confirmQuestionImport() {
         };
 
         // Every book name in use (question book/group fields and lecture books), with how many questions use it.
+        // Pairs of books that look like ONE book stored under two names: the same name written differently, or at least
+        // half of the smaller book's questions are also in the other one.
+        async function findBooksStoredTwice() {
+            const questions = await db.getAllQuestions();
+            const books = new Map();
+            for (const q of questions) {
+                const name = typeof q.book === 'string' ? q.book.trim() : '';
+                if (!name) continue;
+                let b = books.get(name);
+                if (!b) books.set(name, b = { name, norm: QuestionImport.normalizeText(name), count: 0, keys: new Set(), firstId: q.id });
+                b.count++;
+                b.firstId = Math.min(b.firstId, q.id);
+                const key = QuestionImport.dupKey(q);
+                if (key) b.keys.add(key);
+            }
+            const list = [...books.values()], pairs = [];
+            for (let i = 0; i < list.length; i++) {
+                for (let j = i + 1; j < list.length; j++) {
+                    const a = list[i], b = list[j];
+                    const small = a.keys.size <= b.keys.size ? a : b, big = small === a ? b : a;
+                    let shared = 0;
+                    for (const key of small.keys) if (big.keys.has(key)) shared++;
+                    const sameName = !!a.norm && a.norm === b.norm;
+                    if (!sameName && !(shared >= 3 && shared * 2 >= small.keys.size)) continue;
+                    // The older book (its first question was added first) is offered first as the name to keep.
+                    const [first, second] = a.firstId <= b.firstId ? [a, b] : [b, a];
+                    pairs.push({ a: first.name, b: second.name, aCount: first.count, bCount: second.count, shared, sameName,
+                        ratio: small.keys.size ? shared / small.keys.size : 0 });
+                }
+            }
+            return pairs.sort((x, y) => (y.sameName - x.sameName) || (y.ratio - x.ratio) || (y.shared - x.shared));
+        }
+        window.findBooksStoredTwice = findBooksStoredTwice;
+
+        async function renderBooksStoredTwice() {
+            const area = document.getElementById('sameBooksArea');
+            if (!area) return;
+            area.innerHTML = '<p style="color:var(--text2);font-size:0.88rem;">Comparing the books…</p>';
+            let pairs;
+            try { pairs = await findBooksStoredTwice(); }
+            catch (error) { area.innerHTML = `<p style="color:var(--danger);">Could not compare the books: ${escapeHTML(error && error.message ? error.message : String(error))}</p>`; return; }
+            if (!pairs.length) { area.innerHTML = '<p style="font-size:0.9rem;">No book is stored twice.</p>'; return; }
+            area.innerHTML = `<p style="font-size:0.88rem;color:var(--text2);margin-bottom:8px;">${pairs.length} pair(s) found. If two names are one book, choose the name to keep. If they really are different books, leave them: students already see a shared question once outside book study.</p>` +
+                pairs.map((p, i) => `<div class="same-book-pair" data-pair="${i}" style="border:1px solid var(--border);border-radius:12px;padding:10px 12px;margin-bottom:8px;">
+                    <p style="margin:0 0 4px;"><strong>${escapeHTML(p.a)}</strong> <span style="color:var(--text2);">(${p.aCount} questions)</span></p>
+                    <p style="margin:0 0 6px;"><strong>${escapeHTML(p.b)}</strong> <span style="color:var(--text2);">(${p.bCount} questions)</span></p>
+                    <p style="margin:0 0 8px;font-size:0.88rem;">${p.sameName ? 'The same name written differently. ' : ''}${p.shared} question(s) are in both.</p>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                      <button type="button" class="btn btn-primary btn-sm" data-merge-keep="a" data-pair="${i}">Merge, keep the name “${escapeHTML(p.a)}”</button>
+                      <button type="button" class="btn btn-outline btn-sm" data-merge-keep="b" data-pair="${i}">Merge, keep the name “${escapeHTML(p.b)}”</button>
+                    </div></div>`).join('');
+            area.onclick = async event => {
+                const button = event.target.closest('button[data-merge-keep]');
+                if (!button || button.disabled) return;
+                if (!RBAC.requireAdmin()) return;
+                const pair = pairs[Number(button.dataset.pair)];
+                if (!pair) return;
+                const into = button.dataset.mergeKeep === 'a' ? pair.a : pair.b, from = into === pair.a ? pair.b : pair.a;
+                const fromCount = from === pair.a ? pair.aCount : pair.bCount;
+                if (!confirm(`Merge these two books into "${into}"?\n\n` +
+                    `• ${pair.shared} question(s) are in both: one copy of each stays, with the details of the latest upload.\n` +
+                    `• ${Math.max(0, fromCount - pair.shared)} other question(s) move from "${from}" to "${into}".\n` +
+                    `• "${from}" disappears from the list of books.\n\n` +
+                    'Students get the change after you press Publish. This cannot be undone.')) return;
+                area.querySelectorAll('button').forEach(b => { b.disabled = true; });
+                try {
+                    const done = await db.mergeBooks(from, into);
+                    if (!done) { renderBooksStoredTwice(); return; }       // refused (archived specialty): a message was already shown
+                    if (AppState.studyFilter && AppState.studyFilter.book === from) AppState.studyFilter.book = into;
+                    showToast(`Merged into "${into}": ${done.removed} repeated question(s) removed, ${done.moved} moved. Press Publish so students get the change.`, 'success');
+                    populateDeleteBookDropdown();
+                    renderBooksStoredTwice();
+                } catch (error) {
+                    showToast('Could not merge the books: ' + (error && error.message ? error.message : error), 'error');
+                    renderBooksStoredTwice();
+                }
+            };
+        }
+
         async function listBookNames(){
             const [questions, lectures] = await Promise.all([db.getAllQuestions(), db.getAllLectures().catch(() => [])]);
             const counts = new Map();
