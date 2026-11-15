@@ -1486,8 +1486,8 @@
           <button class="btn btn-accent btn-block mt-2" id="btnRunExportUpdate">${uiIcon("export")} Export ${esc(curSpec.name)} Package (.qbpkg)</button>
           <div id="exportUpdateResult" style="margin-top:12px;font-size:0.82rem;color:var(--text2);"></div>
           <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;">
-          <p style="font-size:0.85rem;color:var(--text2);"><b>Free version:</b> <b>${questionPublication.questions.filter(q => q.isFree === true).length}</b> question(s) are marked Free (250 planned; Questions → <b>Auto-select 250</b> fills it up). This is the free version: a student without a subscription sees only these. This exports only those, for <b>${esc(curSpec.name)}</b>, as <code>${esc(curSpec.id)}.qbpkg</code>. Put that file in the <code>free-packs/</code> folder next to <code>index.html</code> in the Student app before publishing it. Each specialty has its own free pack and only its own students download it.</p>
-          <button class="btn btn-outline btn-block" id="btnRunExportFree">${uiIcon("export")} Export ${esc(curSpec.name)} Free Pack (${esc(curSpec.id)}.qbpkg)</button>
+          <p style="font-size:0.85rem;color:var(--text2);"><b>Free version:</b> <b>${questionPublication.questions.filter(q => q.isFree === true).length}</b> question(s) are marked Free (250 planned; Questions → <b>Auto-select 250</b> fills it up). This is the free version: a student without a subscription sees only these. <b>Publish free version</b> (Free version card) sends them to every student of <b>${esc(curSpec.name)}</b> without a subscription automatically; nothing has to be uploaded to the Student site. The button below only downloads a copy (<code>${esc(curSpec.id)}.qbpkg</code>) for your records.</p>
+          <button class="btn btn-outline btn-block" id="btnRunExportFree">${uiIcon("export")} Download a copy of the ${esc(curSpec.name)} free version (${esc(curSpec.id)}.qbpkg)</button>
           <div id="exportFreeResult" style="margin-top:12px;font-size:0.82rem;color:var(--text2);"></div>
         </div>`;
 
@@ -1677,7 +1677,7 @@
                     }
                     const result = await exportUpdatePackage({ mode: 'free' });
                     const c = result.manifest.contentSummary;
-                    resultBox.innerHTML = `${uiIcon("check")} Exported <b>${esc(result.manifest.specialty.id)}.qbpkg</b> for ${esc(result.manifest.specialty.name)} (${formatBytes(result.sizeBytes)}) — ${c.questions} free questions, ${c.images} images. Place it in <code>free-packs/</code> of the Student app.`;
+                    resultBox.innerHTML = `${uiIcon("check")} Exported <b>${esc(result.manifest.specialty.id)}.qbpkg</b> for ${esc(result.manifest.specialty.name)} (${formatBytes(result.sizeBytes)}) — ${c.questions} free questions, ${c.images} images. This is only a copy: Publish free version (Free version card) sends it to students.`;
                     showToast('Free pack downloaded.', 'success');
                 } catch (e) {
                     resultBox.innerHTML = `<span style="color:var(--danger);">Export failed: ${esc(e.message)}</span>`;

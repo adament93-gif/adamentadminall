@@ -238,8 +238,8 @@
       updatedAt: f.updatedAt && f.updatedAt.timestampValue || '' };
   }
 
-  async function readMeta(tk, packId) {
-    try { return parseMeta(await request(FS + '/packs/' + encodeURIComponent(packId), { headers: authHeaders(tk) })); }
+  async function readMeta(tk, packId, collection) {
+    try { return parseMeta(await request(FS + '/' + (collection || 'packs') + '/' + encodeURIComponent(packId), { headers: authHeaders(tk) })); }
     catch (e) { if (e.status === 404) return null; throw e; }
   }
 
@@ -247,20 +247,25 @@
   // (A pack written by app 1.3.x has no specialtyId: it is the ENT pack.)
   function packOwner(meta) { return meta ? (meta.specialtyId || Core.LEGACY_SPECIALTY_ID) : null; }
 
-  async function uploadPack(tk, packId, spec, built, gz, sha, raw, progress) {
+  // opts.collection: 'packs' (the full bank, subscribers) or 'freepacks' (the free version, every student of the specialty).
+  // opts.extra: more fields for the pack document (freeUids for the free pack).
+  async function uploadPack(tk, packId, spec, built, gz, sha, raw, progress, opts) {
+    opts = opts || {};
+    var coll = opts.collection || 'packs';
+    var base = FS + '/' + coll + '/' + encodeURIComponent(packId);
     var version = built.manifest.packageVersion;
     var prefix = 'v' + String(version).replace(/[^A-Za-z0-9]/g, '');
     var count = Math.max(1, Math.ceil(gz.length / CHUNK_BYTES));
 
-    var previous = await readMeta(tk, packId);
+    var previous = await readMeta(tk, packId, coll);
     if (previous && packOwner(previous) !== spec.id) {
       throw cloudError('CROSS_SPECIALTY', { message: 'The pack at "' + packId + '" belongs to the "' + packOwner(previous) + '" specialty, not "' + spec.id + '". Nothing was uploaded.' });
     }
 
     for (var i = 0; i < count; i++) {
-      progress('Uploading ' + (packId === LEGACY_PACK_ID ? 'legacy ENT copy ' : '') + (i + 1) + ' / ' + count + '...');
+      progress('Uploading ' + (opts.label || (packId === LEGACY_PACK_ID ? 'legacy ENT copy ' : '')) + (i + 1) + ' / ' + count + '...');
       var part = gz.subarray(i * CHUNK_BYTES, Math.min(gz.length, (i + 1) * CHUNK_BYTES));
-      await request(FS + '/packs/' + encodeURIComponent(packId) + '/chunks/' + prefix + '_' + pad(i), {
+      await request(base + '/chunks/' + prefix + '_' + pad(i), {
         method: 'PATCH', headers: authHeaders(tk, true),
         body: JSON.stringify({ fields: { prefix: sv(prefix), i: iv(i), data: { bytesValue: bytesToB64(part) } } })
       });
@@ -268,21 +273,75 @@
 
     var updatedAt = new Date().toISOString();
     var questions = built.manifest.contentSummary.questions;
-    await request(FS + '/packs/' + encodeURIComponent(packId), {
-      method: 'PATCH', headers: authHeaders(tk, true),
-      body: JSON.stringify({ fields: { version: sv(version), prefix: sv(prefix), chunkCount: iv(count), gzBytes: iv(gz.length),
-        rawBytes: iv(raw.length), sha256: sv(sha), questions: iv(questions), updatedAt: tv(updatedAt),
-        specialtyId: sv(spec.id), specialtyName: sv(spec.name), schemaVersion: iv(Core.SCHEMA_VERSION) } })
-    });
+    var fields = { version: sv(version), prefix: sv(prefix), chunkCount: iv(count), gzBytes: iv(gz.length),
+      rawBytes: iv(raw.length), sha256: sv(sha), questions: iv(questions), updatedAt: tv(updatedAt),
+      specialtyId: sv(spec.id), specialtyName: sv(spec.name), schemaVersion: iv(Core.SCHEMA_VERSION) };
+    Object.keys(opts.extra || {}).forEach(function (k) { fields[k] = opts.extra[k]; });
+    await request(base, { method: 'PATCH', headers: authHeaders(tk, true), body: JSON.stringify({ fields: fields }) });
 
     // The new version is live; remove the previous version's chunks (best effort).
     if (previous && previous.prefix && previous.prefix !== prefix) {
       for (var j = 0; j < previous.chunkCount; j++) {
-        try { await request(FS + '/packs/' + encodeURIComponent(packId) + '/chunks/' + previous.prefix + '_' + pad(j), { method: 'DELETE', headers: authHeaders(tk) }); }
+        try { await request(base + '/chunks/' + previous.prefix + '_' + pad(j), { method: 'DELETE', headers: authHeaders(tk) }); }
         catch (e) { /* leftover chunk is harmless */ }
       }
     }
     return { version: version, questions: questions, gzBytes: gz.length, rawBytes: raw.length, chunkCount: count, updatedAt: updatedAt, packId: packId };
+  }
+
+  async function gzipBytes(raw) {
+    return new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());
+  }
+
+  /**
+   * The free version of the open specialty (the questions marked Free, at most 250) at freepacks/<specialtyId>. Any signed-in
+   * student of that specialty may read it (no subscription needed), so it reaches the free version, students without a
+   * subscription and students whose subscription ended, and it changes for all of them each time you publish.
+   * freeUids lists the free questions, so a question you unmark stops being free on the students' devices too.
+   */
+  async function publishFree(tk, spec, U, progress) {
+    var max = (window.ENT_FREE_SAMPLE && window.ENT_FREE_SAMPLE.max) || 250;
+    var free = (await db.getAllQuestions()).filter(function (q) { return q.isFree === true; });
+    if (free.length > max) {
+      throw cloudError('FREE_LIMIT', { message: free.length + ' questions are marked Free but the free version is limited to ' + max + '. Unmark ' + (free.length - max) + ' in Questions, then publish again. Nothing was uploaded.' });
+    }
+    var base = FS + '/freepacks/' + encodeURIComponent(spec.id);
+    if (!free.length) {
+      // Nothing is free: publish an empty free version, so students' devices un-mark their old free questions.
+      var prev = await readMeta(tk, spec.id, 'freepacks');
+      await request(base, { method: 'PATCH', headers: authHeaders(tk, true), body: JSON.stringify({ fields: {
+        version: sv('empty-' + Date.now()), prefix: sv(''), chunkCount: iv(0), gzBytes: iv(0), rawBytes: iv(0), sha256: sv(''), questions: iv(0),
+        updatedAt: tv(new Date().toISOString()), specialtyId: sv(spec.id), specialtyName: sv(spec.name), schemaVersion: iv(Core.SCHEMA_VERSION),
+        freeUids: { arrayValue: {} } } }) });
+      if (prev && prev.prefix) {
+        for (var j = 0; j < prev.chunkCount; j++) {
+          try { await request(base + '/chunks/' + prev.prefix + '_' + pad(j), { method: 'DELETE', headers: authHeaders(tk) }); } catch (e) { /* harmless */ }
+        }
+      }
+      return { questions: 0 };
+    }
+    progress('Building the free version (' + free.length + ' questions)...');
+    var built = await U.buildEntpkg({ mode: 'free' });
+    if (!built.manifest.specialty || built.manifest.specialty.id !== spec.id) {
+      throw cloudError('MISMATCH', { message: 'The free version was built for a different specialty. Nothing was uploaded.' });
+    }
+    var raw = new Uint8Array(await built.blob.arrayBuffer());
+    var uids = [];
+    try {
+      var zip = await JSZip.loadAsync(raw);
+      var dbFile = zip.file('database.json');
+      var data = JSON.parse(await dbFile.async('string'));
+      uids = (data.questions || []).map(function (q) { return q && q.uid; }).filter(Boolean);
+    } catch (e) {
+      throw cloudError('TOOLS', { message: 'The free version could not be read back (' + (e && e.message ? e.message : e) + '). Nothing was uploaded.' });
+    }
+    var gz = await gzipBytes(raw);
+    var sha = hex(await crypto.subtle.digest('SHA-256', gz));
+    var info = await uploadPack(tk, spec.id, spec, built, gz, sha, raw, progress, {
+      collection: 'freepacks', label: 'free version ',
+      extra: { freeUids: { arrayValue: { values: uids.map(function (u) { return sv(u); }) } } }
+    });
+    return { questions: info.questions, version: info.version };
   }
 
   /**
@@ -299,6 +358,10 @@
     if (spec.archived) throw cloudError('ARCHIVED', { message: '"' + spec.name + '" is archived and read-only, so it cannot be published.' });
     var mirror = options.legacyMirror === true && spec.id === Core.LEGACY_SPECIALTY_ID;
 
+    var tk = await token();
+    progress('Registering the specialty...');
+    await syncSpecialties([spec.id]); // students and the rules need specialties/<id> to exist
+
     progress('Building the full package for ' + spec.name + '...');
     var built = await U.buildEntpkg({ mode: 'full', legacyCompatible: mirror });
     if (!built.manifest.specialty || built.manifest.specialty.id !== spec.id) {
@@ -307,12 +370,9 @@
     var raw = new Uint8Array(await built.blob.arrayBuffer());
 
     progress('Compressing...');
-    var gz = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());
+    var gz = await gzipBytes(raw);
     var sha = hex(await crypto.subtle.digest('SHA-256', gz));
 
-    var tk = await token();
-    progress('Registering the specialty...');
-    await syncSpecialties([spec.id]); // students and the rules need specialties/<id> to exist
     var main = await uploadPack(tk, spec.id, spec, built, gz, sha, raw, progress);
     if (mirror) await uploadPack(tk, LEGACY_PACK_ID, spec, built, gz, sha, raw, progress);
 
@@ -320,6 +380,27 @@
     save(infoKey(spec.id), info);
     return info;
   }
+
+  /**
+   * Publishes ONLY the free version of the open specialty (Free version card, separate from the full bank).
+   * Each publish gets a new package version, so students' devices notice the change and update their free questions.
+   */
+  async function publishFreeVersion(progress) {
+    var U = window.__entUpdatePkg;
+    if (!U || typeof U.buildEntpkg !== 'function') throw cloudError('TOOLS', { message: 'The update tools are not ready yet.' });
+    var spec = currentSpec();
+    if (!spec || !spec.id) throw cloudError('NO_SPECIALTY', { message: 'Open a specialty workspace first.' });
+    if (spec.archived) throw cloudError('ARCHIVED', { message: '"' + spec.name + '" is archived and read-only, so it cannot be published.' });
+    var tk = await token();
+    progress('Registering the specialty...');
+    await syncSpecialties([spec.id]);
+    var info = await publishFree(tk, spec, U, progress);
+    info.updatedAt = new Date().toISOString();
+    save(freeInfoKey(spec.id), info);
+    return Object.assign({ specialtyId: spec.id, specialtyName: spec.name }, info);
+  }
+
+  function freeInfoKey(id) { return infoKey(id) + '_free'; }
 
   /* ------------------------------------------------------------------ student accounts */
 
@@ -1297,6 +1378,78 @@
     });
   }
 
+  function freeCardHTML() {
+    var max = (window.ENT_FREE_SAMPLE && window.ENT_FREE_SAMPLE.max) || 250;
+    return '<div class="card" id="entFreeCard"><div class="card-header">Free version (students without a subscription)</div>' +
+      '<p style="font-size:0.85rem;color:var(--text2);margin-bottom:8px;">The questions marked <b>Free</b> are what every student of this specialty sees without a subscription: right after signing up, without a plan, and after a plan ends. ' +
+      'Choose them here or with the <b>Free</b> button on each question, then publish them. This does not touch the full bank.</p>' +
+      '<div style="padding:10px 12px;border:1px solid var(--border);border-radius:12px;margin:0 0 10px;font-size:0.9rem;">Marked Free now: <b id="entFreeCount">…</b> / ' + max +
+      '<br><span style="font-size:0.8rem;color:var(--text2);">Last published: <span id="entFreeLast">…</span></span></div>' +
+      '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;">' +
+      '<button class="btn btn-outline" id="btnFreeAuto">Auto-select ' + max + '</button>' +
+      '<button class="btn btn-outline" id="btnFreeChoose">Choose in Questions</button>' +
+      '<button class="btn btn-outline" id="btnFreeClear">Clear all Free</button></div>' +
+      '<button class="btn btn-primary btn-block" id="btnFreePublish">Publish free version</button>' +
+      '<div id="entFreeMsg" style="margin-top:8px;font-size:0.82rem;color:var(--text2);"></div></div>';
+  }
+
+  async function fillFreeCard() {
+    var countEl = el('entFreeCount'), lastEl = el('entFreeLast');
+    if (!countEl) return;
+    try { countEl.textContent = String((await db.getAllQuestions()).filter(function (q) { return q.isFree === true; }).length); } catch (e) { countEl.textContent = '?'; }
+    var spec = currentSpec();
+    if (!lastEl || !spec) return;
+    var local = load(freeInfoKey(spec.id));
+    try {
+      var meta = await readMeta(await token(), spec.id, 'freepacks');
+      if (!meta) lastEl.textContent = 'never (students without a subscription see no questions yet)';
+      else lastEl.textContent = meta.questions + ' question(s)' + (meta.updatedAt ? ', ' + new Date(meta.updatedAt).toLocaleString() : '');
+    } catch (e) {
+      lastEl.textContent = local ? local.questions + ' question(s), ' + new Date(local.updatedAt).toLocaleString() + ' (from this device)' : 'unknown (offline)';
+    }
+  }
+
+  function freeMsg(text, isError) {
+    var node = el('entFreeMsg');
+    if (!node) return;
+    node.textContent = text || '';
+    node.style.color = isError ? 'var(--danger)' : 'var(--text2)';
+  }
+
+  function wireFreeCard() {
+    if (!el('entFreeCard')) return;
+    fillFreeCard();
+    var auto = el('btnFreeAuto'), choose = el('btnFreeChoose'), clear = el('btnFreeClear'), pub = el('btnFreePublish');
+    if (auto) auto.addEventListener('click', async function () { if (window.autoSelectFree) await window.autoSelectFree(); fillFreeCard(); });
+    if (clear) clear.addEventListener('click', async function () { if (window.clearAllFree) await window.clearAllFree(); fillFreeCard(); });
+    if (choose) choose.addEventListener('click', function () {
+      try { if (window.AppState && AppState.questionFilters) AppState.questionFilters.special = 'all'; } catch (e) { /* ignore */ }
+      if (typeof navigateTo === 'function') navigateTo('questions');
+    });
+    if (pub) pub.addEventListener('click', async function () {
+      if (typeof RBAC !== 'undefined' && !RBAC.requireAdmin()) return;
+      var cur = currentSpec();
+      if (!cur) return freeMsg('Open a specialty workspace first.', true);
+      var n = 0;
+      try { n = (await db.getAllQuestions()).filter(function (q) { return q.isFree === true; }).length; } catch (e) { n = 0; }
+      var ok = window.confirm('Publish the free version of ' + cur.name + '?\n\n    ' + n + ' question(s) marked Free\n\n' +
+        (n ? 'Every ' + cur.name + ' student without a subscription will see exactly these questions (questions you unmarked disappear for them). ' : 'Nothing is marked Free: students without a subscription will see no questions. ') +
+        'The full bank for subscribers is not changed.\n\nContinue?');
+      if (!ok) return;
+      pub.disabled = true;
+      try {
+        var r = await publishFreeVersion(function (t) { freeMsg(t); });
+        freeMsg('Free version published: ' + r.questions + ' question(s). Students get it the next time they open the app.');
+        if (typeof showToast === 'function') showToast(cur.name + ' free version published.', 'success');
+        fillFreeCard();
+      } catch (e) {
+        if (e.code === 'NOT_SIGNED_IN') { signOut(); rerender(); }
+        freeMsg('Publish failed: ' + friendly(e), true);
+        console.error('Free version publish error', e);
+      } finally { pub.disabled = false; }
+    });
+  }
+
   function migrationCardHTML() {
     return '<div class="card"><div class="card-header">ENT migration check</div>' +
       '<p style="font-size:0.85rem;color:var(--text2);">If this project already served ENT students before specialties, run the check to see which one-time steps are still open. Nothing is changed by the check.</p>' +
@@ -1362,12 +1515,12 @@
       '<div style="padding:10px 12px;border:1px solid var(--border);border-radius:12px;background:var(--primary-soft);margin:8px 0;font-size:0.88rem;">' +
       'Publishing target: <b id="entCloudSpecName"></b> <code id="entCloudSpecId"></code><br><span style="color:var(--text2);">Goes to <code>packs/' + esc(spec.id) + '</code>. Only this specialty\'s questions are included.</span></div>' +
       '<p style="font-size:0.85rem;color:var(--text2);">' + last + '</p>' +
-      '<p style="font-size:0.8rem;color:var(--text-muted);">Publishes <b>all</b> current content of this specialty (not only the Free questions). Students of this specialty with an active subscription download it automatically.</p>' +
+      '<p style="font-size:0.8rem;color:var(--text-muted);">Publishes <b>all</b> current content of this specialty for <b>subscribers</b>. Students of this specialty with an active subscription download it automatically. The free version is chosen and published separately, in the <b>Free version</b> card below.</p>' +
       mirror +
       '<button class="btn btn-accent btn-block mt-2" id="btnCloudPublish">Publish ' + esc(spec.name) + ' question bank</button>' +
       '<button class="btn btn-outline btn-block mt-2" id="btnCloudSignOut">Sign out</button>' +
       '<div id="entCloudMsg" style="margin-top:10px;font-size:0.82rem;color:var(--text2);"></div></div>' +
-      accessCardHTML() + accountsCardHTML() + reportsCardHTML() + migrationCardHTML();
+      freeCardHTML() + accessCardHTML() + accountsCardHTML() + reportsCardHTML() + migrationCardHTML();
   }
 
   function setMsg(text, isError) {
@@ -1412,6 +1565,7 @@
 
     var outBtn = el('btnCloudSignOut');
     if (outBtn) outBtn.addEventListener('click', function () { signOut(); rerender(); });
+    wireFreeCard();
 
     var pubBtn = el('btnCloudPublish');
     if (pubBtn) pubBtn.addEventListener('click', async function () {
@@ -1428,7 +1582,7 @@
       var ok = window.confirm('Publish this specialty?\n\n' +
         '    ' + cur.name + '   (ID: ' + cur.id + ')\n' +
         '    ' + count + ' question(s) from this workspace\n\n' +
-        'It will REPLACE the bank that ' + cur.name + ' students download (packs/' + cur.id + (mirror ? ' and the old packs/main' : '') + '). Other specialties are not touched.\n' +
+        'It will REPLACE the bank that ' + cur.name + ' students download (packs/' + cur.id + (mirror ? ' and the old packs/main' : '') + '). The free version is not changed (it has its own Publish button). Other specialties are not touched.\n' +
         'Subscription scope: ' + (scope === 'all' ? 'all specialties' : 'the student\'s own specialty') + '.\n\nContinue?');
       if (!ok) return;
       busy = true;
@@ -1464,7 +1618,7 @@
   }
 
   window.EntCloudAdmin = {
-    cardHTML: cardHTML, wire: wire, publish: publish, signIn: signIn, signOut: signOut, isSignedIn: isSignedIn,
+    cardHTML: cardHTML, wire: wire, publish: publish, publishFreeVersion: publishFreeVersion, signIn: signIn, signOut: signOut, isSignedIn: isSignedIn,
     isConfigured: CONFIGURED, friendly: friendly,
     syncSpecialties: syncSpecialties, pullSpecialties: pullSpecialties, readScope: readScope, writeScope: writeScope,
     loadAccounts: loadAccounts,

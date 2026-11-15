@@ -35,7 +35,7 @@
   // 'main' is the legacy ENT pack path in Firestore; the others are collection / config names.
   var RESERVED_IDS = ['main', 'config', 'settings', 'access', 'admin', 'admins', 'users', 'reports', 'packs',
     'specialties', 'all', 'none', 'default', 'unscoped', 'null', 'undefined', 'legacy'];
-  var LIMITS = { name: 80, description: 500, categories: 200, sectionsPerCategory: 500, itemName: 200 };
+  var LIMITS = { name: 80, description: 500, categories: 200, sectionsPerCategory: 500, itemName: 200, topicsPerSection: 500 };
 
   /* ------------------------------------------------------------------ specialty ids */
 
@@ -166,6 +166,16 @@
         };
         if (s.number != null && Number.isFinite(Number(s.number))) sec.number = Number(s.number);
         if (s.partId) sec.partId = String(s.partId);
+        // Optional topic list of the section (from an uploaded classification file). "General" is built in.
+        if (Array.isArray(s.topics)) {
+          var seenTopics = new Set();
+          sec.topics = s.topics.map(normalizeName).filter(function (t) {
+            var k = nameKey(t);
+            if (!t || k === 'general' || seenTopics.has(k)) return false;
+            seenTopics.add(k);
+            return true;
+          }).slice(0, LIMITS.topicsPerSection);
+        }
         cat.sections.push(sec);
       });
       cat.sections.sort(function (a, b) { return a.order - b.order; });

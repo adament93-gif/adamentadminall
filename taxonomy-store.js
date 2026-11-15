@@ -70,6 +70,9 @@
 
   /* ------------------------------------------------------------------ read */
 
+  var loadedResolve;
+  var loadedPromise = new Promise(function (r) { loadedResolve = r; });
+
   async function load() {
     state = null;
     try {
@@ -81,6 +84,7 @@
         if (!tree.specialtyId || tree.specialtyId === specialtyId()) state = tree;
       }
     } catch (e) { state = null; }
+    loadedResolve();
     return get();
   }
 
@@ -237,10 +241,124 @@
     return true;
   }
 
+  /* ------------------------------------------------------------------ classification files (Classification Guide) */
+
+  var GENERIC_CATEGORY = ['', 'uncategorized', 'uncategorised', 'unclassified', 'غير مصنف', 'غير مصنفة'];
+
+  /**
+   * Reads a classification file:
+   *  - the Classification Guide format (also what Settings -> Download Classification Guide writes):
+   *      { classifications: [ { subject, chapters: [ { chapter, topics: [...] } ] } ] }
+   *  - or this app's own tree: { categories: [ { name, sections: [ { name, topics? } ] } ] }
+   * subject = category, chapter = section, topics = the topics of the section. "Uncategorized" is not a real category and
+   * is skipped; "General" topics are built in. Returns { categories: [{ name, sections: [{ name, topics }] }], specialty,
+   * source, counts: { categories, sections, topics }, warnings }. Throws a readable error for a file it cannot use.
+   */
+  function parseGuide(obj) {
+    if (typeof obj === 'string') {
+      try { obj = JSON.parse(obj.replace(/^\uFEFF/, '')); } catch (e) { throw new Error('This file is not valid JSON (' + e.message + ').'); }
+    }
+    if (!obj || typeof obj !== 'object') throw new Error('This file is empty.');
+    var list, catName, secList, secName, topicList;
+    if (Array.isArray(obj.classifications)) {
+      list = obj.classifications; catName = 'subject'; secList = 'chapters'; secName = 'chapter'; topicList = 'topics';
+    } else if (Array.isArray(obj.categories)) {
+      list = obj.categories; catName = 'name'; secList = 'sections'; secName = 'name'; topicList = 'topics';
+    } else {
+      throw new Error('This file has no "classifications" list (subject / chapters / topics). Use a Classification Guide JSON file.');
+    }
+    var warnings = [], cats = [], byCat = new Map(), skipped = 0;
+    list.forEach(function (c, ci) {
+      if (!c || typeof c !== 'object') { warnings.push('Item ' + (ci + 1) + ' is not a category and was skipped.'); return; }
+      var name = Core.normalizeName(c[catName]);
+      if (GENERIC_CATEGORY.indexOf(Core.nameKey(name)) !== -1) { skipped++; return; }
+      if (name.length > Core.LIMITS.itemName) { warnings.push('Category "' + name.slice(0, 40) + '..." is too long and was skipped.'); return; }
+      var cat = byCat.get(Core.nameKey(name));
+      if (!cat) { cat = { name: name, sections: [], _secs: new Map() }; byCat.set(Core.nameKey(name), cat); cats.push(cat); }
+      else warnings.push('Category "' + name + '" appears twice; the two were combined.');
+      (Array.isArray(c[secList]) ? c[secList] : []).forEach(function (s) {
+        if (!s || typeof s !== 'object') return;
+        var sn = Core.normalizeName(s[secName]);
+        if (!sn) return;
+        if (sn.length > Core.LIMITS.itemName) { warnings.push('A section of "' + name + '" is too long and was skipped.'); return; }
+        var sec = cat._secs.get(Core.nameKey(sn));
+        if (!sec) { sec = { name: sn, topics: [], _t: new Set() }; cat._secs.set(Core.nameKey(sn), sec); cat.sections.push(sec); }
+        else warnings.push('Section "' + sn + '" appears twice in "' + name + '"; the two were combined.');
+        (Array.isArray(s[topicList]) ? s[topicList] : []).forEach(function (t) {
+          var tn = Core.normalizeName(t), tk = Core.nameKey(tn);
+          if (!tn || tk === 'general' || sec._t.has(tk) || tn.length > Core.LIMITS.itemName) return;
+          sec._t.add(tk); sec.topics.push(tn);
+        });
+      });
+    });
+    var counts = { categories: cats.length, sections: 0, topics: 0 };
+    cats.forEach(function (c) {
+      delete c._secs;
+      if (c.sections.length > Core.LIMITS.sectionsPerCategory) throw new Error('"' + c.name + '" has more than ' + Core.LIMITS.sectionsPerCategory + ' sections.');
+      c.sections.forEach(function (s) { delete s._t; counts.sections++; counts.topics += s.topics.length; });
+    });
+    if (!cats.length) throw new Error('This file has no categories to load.');
+    if (cats.length > Core.LIMITS.categories) throw new Error('This file has more than ' + Core.LIMITS.categories + ' categories.');
+    if (skipped) warnings.push('"Uncategorized" is not a real category and was skipped (questions using it stay for your review).');
+    var spec = obj.specialty && typeof obj.specialty === 'object' ? { id: String(obj.specialty.id || ''), name: String(obj.specialty.name || '') } : null;
+    var source = obj.sourceBook && obj.sourceBook.name ? String(obj.sourceBook.name) : '';
+    return { categories: cats, specialty: spec, source: source, counts: counts, warnings: warnings };
+  }
+
+  /**
+   * Puts a parsed classification file into a tree draft.
+   *  merge   (default): keeps everything already there; adds the missing categories / sections and the missing topics.
+   *  replace: the tree becomes exactly the file (in the file's order). Categories and sections whose names already exist
+   *           keep their IDs, so questions stay linked to them.
+   * Returns { categoriesAdded, sectionsAdded, topicsAdded }.
+   */
+  function applyGuide(tree, parsed, mode) {
+    var out = { categoriesAdded: 0, sectionsAdded: 0, topicsAdded: 0 };
+    var before = tree.categories.slice();
+    function findByName(list, name) { return list.filter(function (x) { return Core.nameKey(x.name) === Core.nameKey(name); })[0] || null; }
+    if (mode === 'replace') tree.categories = [];
+    parsed.categories.forEach(function (pc) {
+      var cat = findByName(tree.categories, pc.name);
+      if (!cat) {
+        var old = mode === 'replace' ? findByName(before, pc.name) : null;
+        cat = old ? Object.assign({}, old, { name: pc.name, status: 'active', sections: [] }) : { id: Core.newId('cat'), name: pc.name, description: '', status: 'active', sections: [] };
+        cat.order = tree.categories.length;
+        tree.categories.push(cat);
+        if (!old) out.categoriesAdded++;
+        cat.__old = old;
+      }
+      pc.sections.forEach(function (ps) {
+        var sec = findByName(cat.sections, ps.name);
+        if (!sec) {
+          var oldSec = cat.__old ? findByName(cat.__old.sections || [], ps.name) : null;
+          sec = oldSec ? Object.assign({}, oldSec, { name: ps.name, status: 'active' }) : { id: Core.newId('sec'), name: ps.name, status: 'active' };
+          sec.order = cat.sections.length;
+          cat.sections.push(sec);
+          if (!oldSec) out.sectionsAdded++;
+        }
+        var have = Array.isArray(sec.topics) ? sec.topics.slice() : [];
+        var keys = new Set(have.map(Core.nameKey));
+        ps.topics.forEach(function (t) { if (!keys.has(Core.nameKey(t))) { keys.add(Core.nameKey(t)); have.push(t); out.topicsAdded++; } });
+        if (have.length) sec.topics = have;
+      });
+    });
+    tree.categories.forEach(function (c) { delete c.__old; });
+    return out;
+  }
+
+  /** Topics stored for a category / section (by name), without "General". */
+  function topicsOf(categoryName, sectionName) {
+    var cat = get().categories.filter(function (c) { return c.name === categoryName; })[0];
+    var sec = cat && cat.sections.filter(function (s) { return s.name === sectionName; })[0];
+    return sec && Array.isArray(sec.topics) ? sec.topics.slice() : [];
+  }
+
   window.EntTaxonomy = {
     KEY: KEY, BASELINE_AT: BASELINE_AT, load: load, get: get, hasCustomTree: hasCustomTree, isBaseline: isBaseline, index: index, asScottBrownShape: asScottBrownShape,
     save: save, draft: draft, applyFromPackage: applyFromPackage, mergeLegacyMap: mergeLegacyMap, exportV2: exportV2, exportLegacyMap: exportLegacyMap,
     onChange: function (cb) { if (typeof cb === 'function') listeners.push(cb); },
+    whenLoaded: function () { return loadedPromise; },
+    parseGuide: parseGuide, applyGuide: applyGuide, topicsOf: topicsOf,
     ops: { findCategory: findCategory, findSection: findSection, addCategory: addCategory, addSection: addSection, move: move },
     _fromScottBrown: fromScottBrown
   };

@@ -22,6 +22,18 @@
                 for (const chapter of chapters) branch(subject, chapter);
             } else branch(subject, 'General');
         }
+        // Topics stored with the classification (an uploaded classification file) travel with the guide too.
+        try {
+            const T = global.EntTaxonomy;
+            if (T && typeof T.get === 'function') T.get().categories.forEach(c => {
+                if (c.status === 'archived') return;
+                c.sections.forEach(s => {
+                    if (s.status === 'archived') return;
+                    const set = branch(c.name, s.name);
+                    (Array.isArray(s.topics) ? s.topics : []).forEach(t => set.add(t));
+                });
+            });
+        } catch (e) { /* no stored tree */ }
         for (const question of Array.isArray(questions) ? questions : []) {
             if (!question || typeof question !== 'object') continue;
             branch(question.subject, question.chapter).add(text(question.topic) || 'General');

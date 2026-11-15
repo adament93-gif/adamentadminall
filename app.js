@@ -1594,7 +1594,7 @@ const LazyRenderer = {
                 await this.ensureReady();
                 const existingQuestions = await this.getAllQuestions();
                 const existingSet = new Set(
-                    existingQuestions.map(e => QuestionImport.normalizeText(e.questionText))
+                    existingQuestions.map(e => QuestionImport.sameBookKey(e)).filter(Boolean)
                 );
                 return new Promise((resolve, reject) => {
                     const tx = this.db.transaction('questions', 'readwrite');
@@ -1609,7 +1609,7 @@ const LazyRenderer = {
                         if (groupName && !q.group) q.group = groupName;
                         if (!q.group) q.group = '';
 
-                        const normalizedNew = QuestionImport.normalizeText(q.questionText);
+                        const normalizedNew = QuestionImport.sameBookKey(q) || QuestionImport.normalizeText(q.questionText);
                         let duplicate = false;
                         try {
                             duplicate = existingSet.has(normalizedNew);
@@ -2287,6 +2287,55 @@ function renderQuestionBookLocation(question) {
     return book ? `<div class="question-book-location" style="margin-top:10px;font-size:0.75rem;color:var(--text2);">Book / group: ${questionReferenceEscape(book)}</div>` : '';
 }
 
+// Imported JSON uses the names of this specialty's classification: a small difference (capital letters, spaces,
+// punctuation, "&" vs "and") is corrected to the exact name. Returns true when something was corrected.
+function alignQuestionToTaxonomy(q) {
+    const tree = window.EntTaxonomy ? window.EntTaxonomy.get() : null;
+    if (!q || !tree || !Array.isArray(tree.categories) || !tree.categories.length) return false;
+    const key = questionClassificationKey;
+    const cat = tree.categories.find(c => c.name === q.subject) || tree.categories.find(c => key(c.name) === key(q.subject));
+    if (!cat) return false;
+    let changed = false;
+    if (cat.name !== q.subject) { q.subject = cat.name; changed = true; }
+    const sec = cat.sections.find(s => s.name === q.chapter) || cat.sections.find(s => key(s.name) === key(q.chapter));
+    if (sec) {
+        if (sec.name !== q.chapter) { q.chapter = sec.name; changed = true; }
+        const topics = Array.isArray(sec.topics) ? sec.topics : [];
+        const t = topics.find(x => x === q.topic) || topics.find(x => key(x) === key(q.topic));
+        if (t && t !== q.topic) { q.topic = t; changed = true; }
+    }
+    if (changed) {
+        q.subjectId = q.chapterId = q.chapterNumber = q.partId = null;
+        normalizeQuestionClassification(q, { readNested: false, infer: false });
+    }
+    return changed;
+}
+
+// Categories / sections used by import rows that do not exist in this specialty's classification (generic labels such as
+// Uncategorized / General are not counted: they stay for review). { missing: [{ subject, chapter|null, count }], rows }
+function importTaxonomyGaps(rows) {
+    const tree = window.EntTaxonomy ? window.EntTaxonomy.get() : { categories: [] };
+    const cats = new Map(tree.categories.map(c => [c.name, new Set(c.sections.map(s => s.name))]));
+    const gaps = new Map();
+    let affected = 0;
+    for (const row of rows) {
+        if (!row.selected || row.errors.length || row.duplicateOf) continue;
+        const q = row.question;
+        if (isGenericQuestionSubject(q.subject)) continue;
+        const secs = cats.get(q.subject);
+        let gapKey = null, chapter = null;
+        if (!secs) gapKey = q.subject;
+        else if (!isGenericQuestionChapter(q.chapter) && !secs.has(q.chapter)) { gapKey = q.subject + '\u0000' + q.chapter; chapter = q.chapter; }
+        if (!gapKey) continue;
+        affected++;
+        const g = gaps.get(gapKey) || { subject: q.subject, chapter, count: 0, chapters: new Set() };
+        g.count++;
+        if (!secs && !isGenericQuestionChapter(q.chapter)) g.chapters.add(q.chapter);
+        gaps.set(gapKey, g);
+    }
+    return { missing: [...gaps.values()], rows: affected, empty: !tree.categories.length };
+}
+
 // Classification policy v2: the admin approves suggestions; students only consume metadata.
 function questionClassificationKey(value) {
     return String(value == null ? '' : value).normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
@@ -2639,7 +2688,7 @@ async function scanDuplicateQuestions(){
  const qs=await db.getAllQuestions();
  const map={}, dup=[];
  qs.forEach(q=>{
-   const key=(q.questionText||'').toLowerCase().trim();
+   const key=QuestionImport.sameBookKey(q)||('id:'+q.id);   // a question repeated in ANOTHER book is not a duplicate
    if(map[key]) dup.push(q);
    else map[key]=1;
  });
@@ -2807,6 +2856,8 @@ async function openReclassifyModal(questionId){
  }
  function topicsFor(subject, chapter){
      const set = new Set(['General']);
+     // Topics from the uploaded classification file come first, then any topic real questions already use.
+     try { if (window.EntTaxonomy && EntTaxonomy.topicsOf) EntTaxonomy.topicsOf(subject, chapter).forEach(t => set.add(t)); } catch (e) { /* no tree */ }
      allQuestions.forEach(qq => { if (qq.topic && qq.subject === subject && qq.chapter === chapter) set.add(qq.topic); });
      if (subject === q.subject && chapter === q.chapter && q.topic) set.add(q.topic);
      return [...set].sort();
@@ -3580,7 +3631,8 @@ function openMissingQuestionReferences() {
             const dupMap = new Map();
             const dups = [];
             questions.forEach(q => {
-                const key = (q.questionText || '').toLowerCase().trim();
+                const key = QuestionImport.sameBookKey(q);   // repeats inside the same book only
+                if (!key) return;
                 if (dupMap.has(key)) dups.push(q);
                 else dupMap.set(key, q.id);
             });
@@ -3617,7 +3669,7 @@ function openMissingQuestionReferences() {
                 <button class="btn btn-primary" id="btnAdminAddQ">${uiIcon("plus")} Add Question</button>
                 <button class="btn btn-accent" id="btnAdminBulkImport">${uiIcon("import")} Bulk Import</button>
                 <button class="btn btn-warning" id="btnAdminBulkEdit">${uiIcon("edit")} Bulk Edit</button>
-                <button class="btn btn-danger" id="btnAdminMergeDups">${uiIcon("refresh")} Merge Duplicates (${dups.length})</button>
+                <button class="btn btn-danger" id="btnAdminMergeDups">${uiIcon("refresh")} Remove Repeats Inside a Book (${dups.length})</button>
                 <button class="btn btn-primary" id="btnAdminReclassify">${uiIcon("tag")} Reclassify All</button>
                 <button class="btn btn-danger" id="btnAdminClearAll">${uiIcon("trash")} Clear All</button>
                 <button class="btn btn-outline" data-nav="settings">${uiIcon("settings")} Settings</button>
@@ -3690,12 +3742,13 @@ function openMissingQuestionReferences() {
             const map = new Map();
             const dups = [];
             for (const q of questions) {
-                const key = (q.questionText || '').toLowerCase().trim();
+                const key = QuestionImport.sameBookKey(q);     // only repeats inside the SAME book; other books keep their copy
+                if (!key) continue;
                 if (map.has(key)) dups.push(q);
                 else map.set(key, q.id);
             }
-            if (dups.length === 0) { showToast('No duplicates found.', 'info'); return; }
-            if (!confirm(`Delete ${dups.length} duplicate question(s)? This cannot be undone.`)) return;
+            if (dups.length === 0) { showToast('No duplicates inside a book found.', 'info'); return; }
+            if (!confirm(`Delete ${dups.length} question(s) repeated inside the same book? Copies in other books are kept. This cannot be undone.`)) return;
             let deleted = 0;
             for (const q of dups) {
                 try { await db.deleteQuestion(q.id); deleted++; } catch (e) {}
@@ -4575,9 +4628,9 @@ async function renderDashboard() {
                 }
                 if (!added) break;
             }
-            if (!confirm('Mark ' + pick.length + ' more question(s) as Free, spread across ' + lists.length + ' section(s)?\n\nThe free version will then have ' + (already + pick.length) + ' questions. You can unmark any of them. Then use Export Free Pack and add the file to the Student app.')) return;
+            if (!confirm('Mark ' + pick.length + ' more question(s) as Free, spread across ' + lists.length + ' section(s)?\n\nThe free version will then have ' + (already + pick.length) + ' questions. You can unmark any of them. Then press Publish free version (Settings → Free version) to send it to students.')) return;
             for (const q of pick) await db.updateQuestion(q.id, { isFree: true });
-            showToast(pick.length + ' question(s) marked Free. Now export the Free Pack (Settings → Free version).', 'success');
+            showToast(pick.length + ' question(s) marked Free. Now press Publish free version (Settings → Free version) to send it to students.', 'success');
             renderViewSafely(AppState.currentView);
         }
         window.autoSelectFree = autoSelectFree;
@@ -4586,7 +4639,7 @@ async function renderDashboard() {
             if (!RBAC.requireAdmin()) return;
             const marked = (await db.getAllQuestions()).filter(q => q.isFree === true);
             if (!marked.length) { showToast('No question is marked Free.', 'info'); return; }
-            if (!confirm('Unmark all ' + marked.length + ' Free question(s)? Students without a subscription will see nothing until you mark questions again and export a new Free Pack.')) return;
+            if (!confirm('Unmark all ' + marked.length + ' Free question(s)? Students without a subscription will see no questions after you publish the free version, until you mark questions again.')) return;
             for (const q of marked) await db.updateQuestion(q.id, { isFree: false });
             showToast('All Free marks removed.', 'success');
             renderViewSafely(AppState.currentView);
@@ -5217,6 +5270,18 @@ const QuestionImport = (() => {
             .replace(/[^\p{L}\p{N}]+/gu, ' ').trim() : '';
     }
 
+    // The same MCQ may be in several books: a book is always imported in FULL, and only a repeat inside the SAME book is a
+    // duplicate. Same question = same text and same set of options (case, spacing, punctuation and option order ignored).
+    function dupKey(q) {
+        if (!q) return '';
+        const text = normalizeText(q.questionText);
+        if (!text) return '';
+        const opts = ['A', 'B', 'C', 'D', 'E'].map(l => normalizeText(q['option' + l])).filter(Boolean).sort();
+        return text + '\u0001' + opts.join('\u0002');
+    }
+    function bookKey(q, groupName = '') { return normalizeText((q && q.book) || groupName || ''); }
+    function sameBookKey(q, groupName = '') { const k = dupKey(q); return k ? bookKey(q, groupName) + '\u0000' + k : ''; }
+
     /** Strict CSV reader supporting quoted commas, escaped quotes and multiline cells. */
     function parseCSV(raw) {
         if (typeof raw !== 'string') throw new Error('CSV input must be text.');
@@ -5332,7 +5397,7 @@ const QuestionImport = (() => {
         return q;
     }
 
-    function prepareRows(questions, existingQuestions = []) {
+    function prepareRows(questions, existingQuestions = [], groupName = '') {
         if (!Array.isArray(questions)) throw new Error('No question array was provided.');
         return recheckRows(questions.map((source, key) => {
             const sourceErrors = !source || typeof source !== 'object' || Array.isArray(source)
@@ -5343,33 +5408,40 @@ const QuestionImport = (() => {
             const originalErrors = validateQuestion(question);
             // Valid flat metadata reaches the normalizer; malformed field types remain visible errors.
             // Keep supplied JSON labels; missing labels receive neutral display defaults.
+            let aligned = false;
             if (!sourceErrors.length && !originalErrors.some(error => /must be text|Classification must be|must be true or false/.test(error))) {
                 normalizeQuestionClassification(question);
                 generateTopicSubtopic(question);
+                aligned = alignQuestionToTaxonomy(question);
             }
-            return { key, sourceIndex: key + 1, question, sourceErrors, errors: [], duplicateOf: null, selected: true };
-        }), existingQuestions);
+            return { key, sourceIndex: key + 1, question, sourceErrors, errors: [], duplicateOf: null, selected: true, aligned };
+        }), existingQuestions, groupName);
     }
 
     /** Mutates and returns rows. Only a selected row reserves a within-file duplicate key. */
-    function recheckRows(rows, existingQuestions = []) {
+    function recheckRows(rows, existingQuestions = [], groupName = '') {
         const existingText = new Map(), existingUid = new Map();
         for (const q of existingQuestions) {
-            const text = normalizeText(q.questionText);
-            if (text) existingText.set(text, q.id == null ? 'existing question' : `question ${q.id}`);
-            if (typeof q.uid === 'string' && q.uid.trim()) existingUid.set(q.uid.trim(), q.id == null ? q.uid : `question ${q.id}`);
+            const text = sameBookKey(q);
+            const label = q.id == null ? 'existing question' : `question ${q.id}`;
+            if (text) existingText.set(text, label + ' in the same book');
+            if (typeof q.uid === 'string' && q.uid.trim()) existingUid.set(q.uid.trim(), { label, book: bookKey(q) });
         }
         const fileText = new Map(), fileUid = new Map();
         for (const row of rows) {
             row.errors = [...new Set([...(row.sourceErrors || []), ...validateQuestion(row.question)])];
             row.duplicateOf = null;
-            const text = normalizeText(row.question.questionText);
+            row.otherBookCopy = false;
+            const text = sameBookKey(row.question, groupName);
             const uid = typeof row.question.uid === 'string' ? row.question.uid.trim() : '';
+            const uidHit = uid ? existingUid.get(uid) : null;
             if (!row.errors.length) {
-                if (text && existingText.has(text)) row.duplicateOf = { kind: 'existing', label: existingText.get(text) };
-                else if (uid && existingUid.has(uid)) row.duplicateOf = { kind: 'uid', label: existingUid.get(uid) };
-                else if (text && fileText.has(text)) row.duplicateOf = { kind: 'file', label: `row ${fileText.get(text)}` };
-                else if (uid && fileUid.has(uid)) row.duplicateOf = { kind: 'file', label: `row ${fileUid.get(uid)}` };
+                if (text && existingText.has(text)) row.duplicateOf = { kind: 'existing', label: 'Already in this book (' + existingText.get(text) + ')' };
+                else if (uidHit && uidHit.book === bookKey(row.question, groupName)) row.duplicateOf = { kind: 'uid', label: 'Already in this book (' + uidHit.label + ')' };
+                else if (text && fileText.has(text)) row.duplicateOf = { kind: 'file', label: `Repeated in this file (row ${fileText.get(text)})` };
+                else if (uid && fileUid.has(uid)) row.duplicateOf = { kind: 'file', label: `Repeated in this file (row ${fileUid.get(uid)})` };
+                // Also in ANOTHER book: imported anyway (students studying that book see it), shown once elsewhere.
+                if (!row.duplicateOf && (uidHit || existingQuestions.some(q => dupKey(q) && dupKey(q) === dupKey(row.question)))) row.otherBookCopy = true;
             }
             if (row.errors.length || row.duplicateOf) row.selected = false;
             if (row.selected && !row.errors.length && !row.duplicateOf) {
@@ -5393,7 +5465,7 @@ const QuestionImport = (() => {
         return result;
     }
 
-    return { parse, parseCSV, normalizeText, validateQuestion, prepareRows, recheckRows, summarize };
+    return { parse, parseCSV, normalizeText, dupKey, bookKey, sameBookKey, validateQuestion, prepareRows, recheckRows, summarize };
 })();
 
 
@@ -5432,6 +5504,33 @@ function importPreviewLayoutStyle() {
     </style>`;
 }
 
+// Adds the categories / sections that the import rows use but the classification lacks, then re-links the rows.
+async function addImportGapsToTaxonomy() {
+    const state = ImportPreviewState;
+    if (!state || state.busy || !RBAC.requireAdmin()) return;
+    if (!window.EntTaxonomy || !EntTaxonomy.mergeLegacyMap) return;
+    if (window.EntWorkspace && EntWorkspace.isArchived && EntWorkspace.isArchived()) { showToast('This specialty is archived and read-only.', 'error'); return; }
+    const map = {};
+    for (const g of importTaxonomyGaps(state.rows).missing) {
+        map[g.subject] = map[g.subject] || [];
+        if (g.chapter) map[g.subject].push(g.chapter);
+        g.chapters.forEach(ch => map[g.subject].push(ch));
+    }
+    try {
+        const r = await EntTaxonomy.mergeLegacyMap(map);
+        for (const row of state.rows) {
+            if (row.errors.length) continue;
+            row.question.subjectId = row.question.chapterId = row.question.chapterNumber = row.question.partId = null;
+            normalizeQuestionClassification(row.question, { readNested: false, infer: false });
+        }
+        state.rows = QuestionImport.recheckRows(state.rows, state.existingQuestions, state.groupName);
+        renderQuestionImportPreview();
+        showToast('Classification updated: +' + r.categoriesAdded + ' categor' + (r.categoriesAdded === 1 ? 'y' : 'ies') + ', +' + r.sectionsAdded + ' section(s).', 'success');
+    } catch (error) {
+        showToast('Could not update the classification: ' + (error.message || error), 'error');
+    }
+}
+
 async function beginQuestionImportPreview() {
     if (!RBAC.requireAdmin()) return;
     if (ImportPreviewState && ImportPreviewState.busy) return;
@@ -5453,7 +5552,7 @@ async function beginQuestionImportPreview() {
             showToast('Source changed. Preview it again before importing.', 'info');
             return;
         }
-        const rows = QuestionImport.prepareRows(questions, existingQuestions);
+        const rows = QuestionImport.prepareRows(questions, existingQuestions, groupName);
         ImportPreviewState = {
             rows,
             groupName,
@@ -5535,7 +5634,8 @@ function renderQuestionImportPreview() {
         const q = row.question;
         const status = importPreviewRowStatus(row);
         const blocked = row.errors.length > 0 || !!row.duplicateOf;
-        const messages = row.errors.length ? row.errors : row.duplicateOf ? [row.duplicateOf.label] : status === 'review' ? ['Classification needs approval before publication to students.'] : [];
+        const messages = (row.errors.length ? row.errors : row.duplicateOf ? [row.duplicateOf.label] : status === 'review' ? ['Classification needs approval before publication to students.'] : [])
+            .concat(!row.errors.length && !row.duplicateOf && row.otherBookCopy ? ['Also in another book: imported for this book; students see it once outside book study.'] : []);
         const badge = status === 'ready' ? 'Ready' : status === 'review' ? 'Needs Review' : status === 'invalid' ? 'Invalid' : 'Duplicate';
         const badgeClass = status === 'ready' ? 'badge-primary' : status === 'invalid' ? 'badge-danger' : 'badge-warning';
         return `<tr data-import-row="${row.key}" style="vertical-align:top;${row.selected ? '' : 'opacity:0.8;'}">
@@ -5563,9 +5663,21 @@ function renderQuestionImportPreview() {
         </tr>`;
     };
 
+    const gaps = importTaxonomyGaps(state.rows);
+    const alignedCount = state.rows.filter(row => row.aligned).length;
+    const gapList = gaps.missing.slice(0, 12).map(g => `<li>${importPreviewEscape(g.subject)}${g.chapter ? ' › ' + importPreviewEscape(g.chapter) : ' <em>(new category' + (g.chapters.size ? ', ' + g.chapters.size + ' section(s)' : '') + ')</em>'} <span style="color:var(--text2);">— ${g.count} question(s)</span></li>`).join('');
+    const taxBanner = (gaps.missing.length || alignedCount) ? `<div class="card" style="border-color:${gaps.missing.length ? 'var(--warning)' : 'var(--border)'};margin:0 0 12px;" id="importTaxonomyReport">
+        <div style="font-weight:700;margin-bottom:6px;">Classification check — مطابقة التصنيف</div>
+        ${alignedCount ? `<p style="margin:0 0 6px;">${alignedCount} question(s) had small spelling differences (capitals, spaces, punctuation) and now use the exact names of this specialty's classification.</p>` : ''}
+        ${gaps.missing.length ? `<p style="margin:0 0 6px;">${gaps.empty ? 'This specialty has no classification yet. ' : ''}${gaps.rows} question(s) use categories or sections that are not in ${gaps.empty ? 'it' : 'this specialty\'s classification'}:</p>
+        <ul style="margin:0 0 8px;padding-inline-start:20px;">${gapList}${gaps.missing.length > 12 ? `<li>… and ${gaps.missing.length - 12} more</li>` : ''}</ul>
+        <p style="margin:0 0 8px;color:var(--text2);">Add them to the classification, or open a question with Edit Details and pick an existing category and section. If you do neither, they are imported and wait in Classification Review.</p>
+        <button type="button" class="btn btn-primary btn-sm" data-import-action="add-missing-tax" ${disabled}>Add the missing ${gaps.missing.length === 1 ? 'name' : gaps.missing.length + ' names'} to the classification</button>` : ''}
+    </div>` : '';
     area.innerHTML = `${importPreviewLayoutStyle()}<div class="card" id="questionImportPreviewCard" aria-busy="${busy}">
         <div class="card-header">Question Import Preview — معاينة الاستيراد</div>
         <p style="color:var(--text2);">Review the questions, exclude rows and edit classifications. Changes on this screen are saved only after Confirm Import.</p>
+        ${taxBanner}
         ${progress}
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
             <label for="importPreviewFilter">Show</label>
@@ -5597,7 +5709,7 @@ function renderQuestionImportPreview() {
             const row = ImportPreviewState.rows.find(item => item.key === Number(checkbox.dataset.importRowKey));
             if (!row || row.errors.length || row.duplicateOf) return;
             row.selected = checkbox.checked;
-            ImportPreviewState.rows = QuestionImport.recheckRows(ImportPreviewState.rows, ImportPreviewState.existingQuestions);
+            ImportPreviewState.rows = QuestionImport.recheckRows(ImportPreviewState.rows, ImportPreviewState.existingQuestions, ImportPreviewState.groupName);
             renderQuestionImportPreview();
             return;
         }
@@ -5612,6 +5724,7 @@ function renderQuestionImportPreview() {
         if (!button || !ImportPreviewState || ImportPreviewState.busy || button.disabled) return;
         const action = button.dataset.importAction;
         if (action === 'edit') { editImportPreviewClassification(Number(button.dataset.importKey)); return; }
+        if (action === 'add-missing-tax') { addImportGapsToTaxonomy(); return; }
         if (action === 'previous') ImportPreviewState.page--;
         if (action === 'next') ImportPreviewState.page++;
         if (action === 'select-visible' || action === 'exclude-visible') {
@@ -5619,7 +5732,7 @@ function renderQuestionImportPreview() {
                 if (action === 'exclude-visible') row.selected = false;
                 else if (!row.errors.length && !row.duplicateOf) row.selected = true;
             }
-            ImportPreviewState.rows = QuestionImport.recheckRows(ImportPreviewState.rows, ImportPreviewState.existingQuestions);
+            ImportPreviewState.rows = QuestionImport.recheckRows(ImportPreviewState.rows, ImportPreviewState.existingQuestions, ImportPreviewState.groupName);
         }
         renderQuestionImportPreview();
     };
@@ -5715,7 +5828,7 @@ function editImportPreviewClassification(key) {
         normalizeQuestionClassification(revised, { readNested: false, infer: false, approve: !!approveClassification });
         generateTopicSubtopic(revised);
         row.question = revised;
-        state.rows = QuestionImport.recheckRows(state.rows, state.existingQuestions);
+        state.rows = QuestionImport.recheckRows(state.rows, state.existingQuestions, state.groupName);
         closeModal();
         renderQuestionImportPreview();
         showToast(isQuestionClassificationApproved(revised) ? 'Details updated in preview.' : 'Details saved in preview; classification remains in review.', isQuestionClassificationApproved(revised) ? 'success' : 'warning');
@@ -5775,17 +5888,19 @@ async function saveQuestionImport(questions, groupName = '') {
         existing.onsuccess = () => {
             try {
                 if (!RBAC.isAdmin()) throw new Error('Admin access required.');
-                const textKeys = new Set(existing.result.map(q => QuestionImport.normalizeText(q.questionText)).filter(Boolean));
-                const uids = new Set(existing.result.map(q => typeof q.uid === 'string' ? q.uid.trim() : '').filter(Boolean));
+                const textKeys = new Set(existing.result.map(q => QuestionImport.sameBookKey(q)).filter(Boolean));
+                const uids = new Map(existing.result.filter(q => typeof q.uid === 'string' && q.uid.trim()).map(q => [q.uid.trim(), QuestionImport.bookKey(q)]));
                 for (const q of prepared) {
-                    const key = QuestionImport.normalizeText(q.questionText);
-                    if ((key && textKeys.has(key)) || (q.uid && uids.has(q.uid))) {
+                    const key = QuestionImport.sameBookKey(q);
+                    const uidBook = q.uid ? uids.get(q.uid) : undefined;
+                    if ((key && textKeys.has(key)) || (uidBook !== undefined && uidBook === QuestionImport.bookKey(q))) {
                         result.skippedDuplicates++;
                         continue;
                     }
+                    if (uidBook !== undefined) q.uid = '';            // same question in another book: its own record and uid
                     if (!q.uid) q.uid = __entUpdatePkg.genUid();
                     if (key) textKeys.add(key);
-                    uids.add(q.uid);
+                    uids.set(q.uid, QuestionImport.bookKey(q));
                     store.add(q);
                     result.added++;
                     if (!isQuestionClassificationApproved(q)) result.review++;
@@ -5805,7 +5920,7 @@ async function confirmQuestionImport() {
     const state = ImportPreviewState;
     if (!state || state.busy || state.step !== 'confirm') return;
     if (!RBAC.requireAdmin()) return;
-    QuestionImport.recheckRows(state.rows, state.existingQuestions);
+    QuestionImport.recheckRows(state.rows, state.existingQuestions, state.groupName);
     const selected = state.rows.filter(row => row.selected && !row.errors.length && !row.duplicateOf);
     if (!selected.length) { state.step = 'preview'; renderQuestionImportPreview(); return; }
     const summary = QuestionImport.summarize(state.rows);

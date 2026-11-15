@@ -36,6 +36,8 @@
       '.ws-chip.is-archived .ws-dot{background:var(--danger)}',
       '.ws-banner{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:10px 14px;margin:0 0 14px;border:1px solid var(--border);border-radius:14px;background:var(--primary-soft);font-size:.86rem}',
       '.ws-banner.is-archived{background:var(--danger-soft)}',
+      '.tax-guide-preview{padding:12px 14px;border:1px solid var(--border);border-radius:12px;background:var(--primary-soft);font-size:.88rem}',
+      '.tax-guide-preview .spec-actions{margin-top:10px}',
       '.ws-banner.is-inactive{background:var(--surface-hover)}',
       '.ws-banner code,.spec-card code{font-size:.78rem;padding:1px 6px;border-radius:6px;background:var(--surface-hover)}',
       '.ws-banner .ws-spacer{flex:1 1 auto}',
@@ -162,6 +164,8 @@
       '<label class="modal-field">Specialty ID (permanent) *<input type="text" id="specNewId" maxlength="40" autocapitalize="none" spellcheck="false" placeholder="e.g. dermatology"></label>' +
       '<div id="specIdHint" class="spec-muted" style="margin:-8px 0 12px;"></div>' +
       '<label class="modal-field">Description (optional)<textarea id="specNewDesc" rows="2" maxlength="' + Core.LIMITS.description + '"></textarea></label>' +
+      '<label class="modal-field">Classification file (optional)<input type="file" id="specNewTaxFile" accept=".json,application/json"></label>' +
+      '<div class="spec-muted" style="margin:-8px 0 12px;">A Classification Guide JSON (subject → category, chapter → section, topics). The new specialty opens with this whole classification, like the built-in ENT one. You can also upload it later in Categories &amp; sections.</div>' +
       '<button type="submit" class="btn btn-primary btn-block">' + uiIcon('plus') + ' Create specialty</button></form></div>';
   }
 
@@ -208,13 +212,23 @@
       check();
     });
     idEl.addEventListener('input', function () { touched = true; check(); });
-    form.addEventListener('submit', function (e) {
+    form.addEventListener('submit', async function (e) {
       e.preventDefault();
       if (!isAdmin()) return toast('Unlock Admin mode first.', 'error');
       try {
+        var fileEl = byId('specNewTaxFile');
+        var file = fileEl && fileEl.files && fileEl.files[0];
+        var parsed = null;
+        if (file) parsed = Tax.parseGuide(await file.text());   // a file that cannot be used stops here, before creating anything
         var rec = Reg.create({ name: nameEl.value, id: idEl.value.trim().toLowerCase() || undefined, description: byId('specNewDesc').value });
-        toast('Specialty "' + rec.name + '" created. Open its workspace to add categories and questions.', 'success');
-        renderViewSafely('specialties');
+        if (!parsed) {
+          toast('Specialty "' + rec.name + '" created. Open its workspace to add categories and questions.', 'success');
+          return renderViewSafely('specialties');
+        }
+        // The classification lives in the specialty's own database: open its workspace and load it there.
+        try { sessionStorage.setItem(PENDING_TAX_KEY, JSON.stringify({ id: rec.id, parsed: parsed, file: file.name })); } catch (err) { throw new Error('The classification could not be kept while the workspace opens: ' + err.message); }
+        toast('Specialty "' + rec.name + '" created. Opening it with its classification...', 'success');
+        setTimeout(function () { Reg.openWorkspace(rec.id); }, 400);
       } catch (err) { toast(err.message, 'error'); }
     });
   }
@@ -331,6 +345,11 @@
       'Every question is placed in one category and one section. Students of this specialty see exactly this list after you export or publish. ' +
       'Renaming updates the questions that use the name. Archive a category or section to retire it without losing questions; delete is only possible while nothing uses it.' +
       (Tax.isBaseline() ? ' This is the built-in ENT list; your first change saves it as your own editable copy (the built-in IDs are kept).' : '') + '</p></div>';
+    var upload = '<div class="card"><div class="card-header">' + uiIcon('upload') + ' Upload classification file</div>' +
+      '<p class="spec-muted" style="margin:0 0 10px;">Load a whole classification at once from a Classification Guide JSON file: <b>subject</b> becomes a category, <b>chapter</b> a section, and its <b>topics</b> are kept too. ' +
+      'You see a preview first. Question JSON files you upload later are matched to these names.</p>' +
+      '<input type="file" id="taxGuideFile" accept=".json,application/json"' + dis + ' aria-label="Classification file">' +
+      '<div id="taxGuidePreview" style="margin-top:10px;"></div></div>';
     var addCat = '<div class="card"><div class="card-header">' + uiIcon('plus') + ' Add a category</div>' +
       '<div class="tax-inline"><input type="text" id="taxNewCategory" maxlength="' + Core.LIMITS.itemName + '" placeholder="e.g. Skin infections"' + dis + '>' +
       '<button type="button" class="btn btn-primary" data-spec-act="tax-add-cat"' + dis + '>' + uiIcon('plus') + ' Add category</button></div></div>';
@@ -345,7 +364,7 @@
           .map(function (o) { return '<option value="' + esc(o.id) + '">' + esc(o.name) + '</option>'; }).join('');
         return '<div class="tax-sec" data-sec-id="' + esc(s.id) + '" data-cat-id="' + esc(c.id) + '">' +
           '<span class="tax-name">' + esc(s.name) + (sArch ? ' <span class="badge badge-warning">Archived</span>' : '') + '</span>' +
-          '<span class="spec-muted">' + (secCount[s.id] || 0) + ' q</span>' +
+          '<span class="spec-muted">' + (secCount[s.id] || 0) + ' q' + (Array.isArray(s.topics) && s.topics.length ? ' · ' + s.topics.length + ' topic' + (s.topics.length === 1 ? '' : 's') : '') + '</span>' +
           '<button type="button" class="btn btn-sm btn-outline" data-spec-act="tax-sec-up"' + (si === 0 || ro ? ' disabled' : '') + '>↑</button>' +
           '<button type="button" class="btn btn-sm btn-outline" data-spec-act="tax-sec-down"' + (si === c.sections.length - 1 || ro ? ' disabled' : '') + '>↓</button>' +
           '<button type="button" class="btn btn-sm btn-outline" data-spec-act="tax-sec-rename"' + dis + '>Rename</button>' +
@@ -367,7 +386,7 @@
         '<div class="tax-inline"><input type="text" maxlength="' + Core.LIMITS.itemName + '" placeholder="New section in ' + esc(c.name) + '" data-new-section="' + esc(c.id) + '"' + dis + '>' +
         '<button type="button" class="btn btn-sm btn-primary" data-spec-act="tax-add-sec"' + dis + '>' + uiIcon('plus') + ' Add section</button></div></div>';
     }).join('') : '<div class="card"><p class="spec-muted" style="margin:0;">No categories yet. Add the first one above, then add sections inside it. Questions can only be classified into categories that exist here.</p></div>';
-    return '<div class="view-header"><h2>' + uiIcon('folder') + ' Categories &amp; sections</h2></div>' + intro + addCat + warn + cats +
+    return '<div class="view-header"><h2>' + uiIcon('folder') + ' Categories &amp; sections</h2></div>' + intro + upload + addCat + warn + cats +
       '<button type="button" class="btn btn-outline btn-block" data-spec-act="goto-specialties">' + uiIcon('arrow-left') + ' Back to Specialties</button>';
   }
 
@@ -415,6 +434,87 @@
     return affected.length;
   }
 
+  /* ------------------------------------------------------------------ classification file upload */
+
+  var PENDING_TAX_KEY = 'ent_pending_taxonomy_v1';
+  var pendingGuide = null;   // { parsed, file }
+
+  // Questions that are placed in the current tree but would lose their category or section with `tree`.
+  async function questionsLostBy(tree) {
+    var oldIdx = Core.indexTaxonomy(Tax.get());
+    var newIdx = Core.indexTaxonomy(Core.normalizeTaxonomy(tree, Ws.id()));
+    return (await db.getAllQuestions()).filter(function (q) {
+      var a = placeOf(q, oldIdx), b = placeOf(q, newIdx);
+      return (a.cat && !b.cat) || (a.sec && !b.sec);
+    }).length;
+  }
+
+  function guideSummary(parsed) {
+    var n = parsed.counts;
+    return n.categories + ' categor' + (n.categories === 1 ? 'y' : 'ies') + ', ' + n.sections + ' section' + (n.sections === 1 ? '' : 's') + ', ' + n.topics + ' topic' + (n.topics === 1 ? '' : 's');
+  }
+
+  async function showGuidePreview(file) {
+    var box = byId('taxGuidePreview');
+    if (!box) return;
+    box.innerHTML = '<p class="spec-muted">Reading ' + esc(file.name) + '...</p>';
+    var parsed;
+    try { parsed = Tax.parseGuide(await file.text()); }
+    catch (err) { pendingGuide = null; box.innerHTML = '<p style="color:var(--danger);margin:0;">' + esc(err.message) + '</p>'; return; }
+    pendingGuide = { parsed: parsed, file: file.name };
+    var mergeDraft = Tax.draft(), added = Tax.applyGuide(mergeDraft, parsed, 'merge');
+    var replaceDraft = Tax.draft(); Tax.applyGuide(replaceDraft, parsed, 'replace');
+    var lost = await questionsLostBy(replaceDraft);
+    var hasTree = Tax.get().categories.length > 0;
+    var other = parsed.specialty && parsed.specialty.id && parsed.specialty.id !== Ws.id();
+    var cats = parsed.categories.map(function (c) {
+      return '<li><b>' + esc(c.name) + '</b> <span class="spec-muted">' + c.sections.length + ' section' + (c.sections.length === 1 ? '' : 's') + '</span></li>';
+    }).join('');
+    box.innerHTML = '<div class="tax-guide-preview">' +
+      '<p style="margin:0 0 6px;"><b>' + esc(file.name) + '</b>' + (parsed.source ? ' <span class="spec-muted">(' + esc(parsed.source) + ')</span>' : '') + '</p>' +
+      '<p style="margin:0 0 8px;">This file has <b>' + guideSummary(parsed) + '</b>.</p>' +
+      '<ul style="margin:0 0 8px;padding-inline-start:20px;max-height:180px;overflow:auto;">' + cats + '</ul>' +
+      (other ? '<p style="color:var(--warning);margin:0 0 8px;">This file was made for the specialty "' + esc(parsed.specialty.name || parsed.specialty.id) + '", not "' + esc(Ws.name()) + '". Check that it is the right file.</p>' : '') +
+      parsed.warnings.map(function (w) { return '<p class="spec-muted" style="margin:0 0 4px;">• ' + esc(w) + '</p>'; }).join('') +
+      (hasTree
+        ? '<p style="margin:8px 0;"><b>Merge</b> keeps what is already here and adds ' + added.categoriesAdded + ' categor' + (added.categoriesAdded === 1 ? 'y' : 'ies') + ', ' + added.sectionsAdded + ' section(s) and ' + added.topicsAdded + ' topic(s). ' +
+          '<b>Replace</b> makes the list exactly this file' + (lost ? ': not possible now, ' + lost + ' question(s) use categories or sections that are not in the file.' : '; categories and sections with the same names keep their questions.') + '</p>'
+        : '') +
+      '<div class="spec-actions">' +
+      '<button type="button" class="btn btn-primary" data-spec-act="tax-guide-merge">' + uiIcon('check') + (hasTree ? ' Merge' : ' Load this classification') + '</button>' +
+      (hasTree ? '<button type="button" class="btn btn-outline" data-spec-act="tax-guide-replace"' + (lost ? ' disabled' : '') + '>Replace</button>' : '') +
+      '<button type="button" class="btn btn-outline" data-spec-act="tax-guide-cancel">Cancel</button></div></div>';
+  }
+
+  async function applyGuideNow(mode) {
+    if (!pendingGuide) throw new Error('Choose a classification file first.');
+    var parsed = pendingGuide.parsed, result = null;
+    if (mode === 'replace') {
+      var draft = Tax.draft(); Tax.applyGuide(draft, parsed, 'replace');
+      var lost = await questionsLostBy(draft);
+      if (lost) throw new Error(lost + ' question(s) use categories or sections that are not in the file, so Replace is not possible. Use Merge.');
+    }
+    await mutateTree(function (t) { result = Tax.applyGuide(t, parsed, mode === 'replace' ? 'replace' : 'merge'); });
+    pendingGuide = null;
+    return result;
+  }
+
+  // A specialty created with a classification file opens here (after the workspace switch) and loads it.
+  async function applyPendingTaxonomy() {
+    var raw = null;
+    try { raw = sessionStorage.getItem(PENDING_TAX_KEY); } catch (e) { return; }
+    if (!raw) return;
+    var pending;
+    try { pending = JSON.parse(raw); } catch (e) { try { sessionStorage.removeItem(PENDING_TAX_KEY); } catch (e2) { /* ignore */ } return; }
+    if (!pending || pending.id !== Ws.id()) return;
+    try { sessionStorage.removeItem(PENDING_TAX_KEY); } catch (e) { /* ignore */ }
+    try {
+      await mutateTree(function (t) { Tax.applyGuide(t, pending.parsed, 'merge'); });
+      toast('Classification loaded for ' + Ws.name() + ': ' + guideSummary(pending.parsed) + '.', 'success');
+      if (isAdmin() && typeof navigateTo === 'function') navigateTo('taxonomy');
+    } catch (err) { toast('The classification file could not be loaded: ' + err.message, 'error'); }
+  }
+
   async function usedBy(test) {
     var idx = Core.indexTaxonomy(Tax.get());
     return (await db.getAllQuestions()).filter(function (q) { return test(placeOf(q, idx)); }).length;
@@ -432,7 +532,16 @@
     var secId = secEl && secEl.getAttribute('data-sec-id');
     var changed = 0, message = '';
 
-    if (act === 'tax-add-cat') {
+    if (act === 'tax-guide-cancel') {
+      pendingGuide = null;
+      var gb = byId('taxGuidePreview'); if (gb) gb.innerHTML = '';
+      var gf = byId('taxGuideFile'); if (gf) gf.value = '';
+      return;
+    } else if (act === 'tax-guide-merge' || act === 'tax-guide-replace') {
+      var res = await applyGuideNow(act === 'tax-guide-replace' ? 'replace' : 'merge');
+      message = 'Classification ' + (act === 'tax-guide-replace' ? 'replaced' : 'loaded') + ': +' + res.categoriesAdded + ' categor' + (res.categoriesAdded === 1 ? 'y' : 'ies') +
+        ', +' + res.sectionsAdded + ' section(s), +' + res.topicsAdded + ' topic(s).';
+    } else if (act === 'tax-add-cat') {
       var input = byId('taxNewCategory');
       var name = Core.normalizeName(input && input.value);
       await mutateTree(function (t) { Tax.ops.addCategory(t, name); });
@@ -554,6 +663,12 @@
   }
 
   function onChange(e) {
+    if (e.target && e.target.id === 'taxGuideFile') {
+      if (!isAdmin()) { toast('Unlock Admin mode first.', 'error'); e.target.value = ''; return; }
+      var f = e.target.files && e.target.files[0];
+      if (f) showGuidePreview(f);
+      return;
+    }
     var el = e.target.closest && e.target.closest('[data-spec-change="tax-sec-move"]');
     if (el && isAdmin()) moveSection(el);
   }
@@ -568,6 +683,7 @@
     });
     document.addEventListener('click', onClick);
     document.addEventListener('change', onChange);
+    if (Tax.whenLoaded) Tax.whenLoaded().then(function () { setTimeout(applyPendingTaxonomy, 0); });
   }
 
   window.EntSpecialtyAdmin = {

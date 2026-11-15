@@ -52,12 +52,28 @@ Questions keep their creation order inside a section; move a question with *Recl
   A v1 package without a specialty is treated as ENT.
 * Backups record their specialty and refuse to restore into another one.
 
+**Classification file (15 Nov 2026).** A specialty's whole classification can be loaded from a Classification Guide JSON
+(`{ classifications: [ { subject, chapters: [ { chapter, topics: [...] } ] } ] }`, the same format Settings → *Download Classification
+Guide* writes): either when creating the specialty (*Classification file (optional)*; the workspace opens with it) or in *Categories &
+sections* → *Upload classification file* (preview, then **Merge**: adds what is missing, or **Replace**: exactly the file, refused while
+questions would lose their category/section). subject = category, chapter = section, topics are stored per section (used by the topic
+list when editing a question and exported in the guide); "Uncategorized" is skipped. Question JSON imports are matched to these names:
+small differences (capitals, spaces, punctuation, &/and) are corrected automatically, and names that do not exist are listed with
+*Add the missing names to the classification*.
+
+**Books and duplicates (15 Nov 2026).** A JSON book is imported in full: a question already present in **another** book is added for
+this book too (its own record and uid); only a repeat inside the **same** book (same text + same set of options) is skipped.
+Re-importing a book adds only what it is missing. *Remove Repeats Inside a Book* (admin dashboard) never deletes the copy in another book.
+Students see one copy outside book study (see the student README).
+
 **Free questions = the free version.** There is no free trial (since 13 Nov 2026): a student without a subscription sees only the
 questions marked *Free*, 250 per specialty. In the Questions list press **Auto-select 250** (keeps what you marked and fills the rest,
 spread evenly over every category and section) or mark them one by one; **Clear all Free** starts over. The counter shows `N / 250`;
-250 is the hard limit. Then Settings → *Export <Specialty> Free Pack* and put the file in `free-packs/<specialtyId>.qbpkg` next to the
-Student app's `index.html` (ENT may also keep the old `free-pack.entpkg`). The Free marks also travel inside the published bank, so
-republish after you change them.
+250 is the hard limit. The free version has its **own card and button**, separate from the full bank: Settings → **Free version**
+(count, *Auto-select 250*, *Choose in Questions*, *Clear all Free*, last publish) → **Publish free version**. It writes
+`freepacks/<specialtyId>` for every student of the specialty without a subscription; students' devices update automatically, and a
+question you unmark stops being free on them. The Cloud card's *Publish <Specialty> question bank* publishes only the full bank for
+subscribers. Nothing is uploaded to the Student site (*Download a copy of the free version* is only a backup).
 
 **Cloud publishing** (Settings → *Cloud (Firebase)*): sign in with your admin e-mail, open the specialty, press
 *Publish <Specialty> question bank*. The confirm dialog names the specialty. It writes `packs/<specialtyId>` and refuses to
@@ -165,6 +181,7 @@ tree. Any failure rejects the **whole** package before anything is written. ENT 
 | `settings/access` | `subscriptionScope` = `selected` \| `all`; `trialDays` (unused since 13 Nov 2026, saved as 0) | admin |
 | `reports/{uid}_{questionUid}` | report with `specialtyId` | student creates (own specialty only), admin reads |
 | `codes/{code}` | uid, plan, days, validUntil, usedAt, usedBy | admin creates; the student marks their own code used while redeeming |
+| `freepacks/{specialtyId}` + `/chunks/*` | the free version (questions marked Free, ≤ 250) + `freeUids` | admin writes (Publish); every signed-in student of that specialty reads |
 | `payments/{referenceId}` | uid, identifier, plan, days, amount, status (Created / Activating / Activated / Paid / AmountMismatch / LinkFailed), env, paymentMethod, dates | the payment Worker (signs in as a service admin); admin reads |
 | `admins/{uid}` | membership marker | you, in the console |
 
