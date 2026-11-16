@@ -65,18 +65,47 @@ small differences (capitals, spaces, punctuation, &/and) are corrected automatic
 this book too (its own record and uid); only a repeat inside the **same** book (same text + same set of options) is skipped.
 Re-importing a book adds only what it is missing. *Remove Repeats Inside a Book* (admin dashboard) never deletes the copy in another book.
 
-**A book uploaded again under another name (16 Nov 2026).** The import preview has a **Book check**: when at least half of an
-uploaded book's questions are already in one stored book with a different name, it asks *same book?* and does not continue
-until answered. *Yes* saves the rows under the stored name (only the new questions are added); *No* imports it as its own book.
-A name that differs only in capitals, spacing or punctuation is saved under the stored spelling without asking.
-*Import → Books stored twice* lists pairs of books that look like one book (same name written differently, or at least half of
-the smaller book shared) and merges a pair into the name you choose (`db.mergeBooks`): a shared question is kept once (the oldest
-record stays, so its uid, Free mark and students' progress stay, and it takes the details of the latest upload); everything else
-moves to the chosen name. Publish afterwards (and Publish free version if the Free count changed).
+**Group B (16 Nov 2026; needs the new `firestore.rules`).**
+*Devices*: `settings/access.maxDevices` (default 2) and `deviceSwapDays` (default 7) from the *Devices per account* card;
+`devices/{uid}` = `{ ids, info, lastSwapAt }`; the rules allow adding while there is room and one replacement per
+`deviceSwapDays`; the account row's *Devices* button reads it, *Reset devices* deletes it.
+*Progress backup* (student `progress-sync.js`): `progress/{uid}/scopes/{specialtyId}` holds a gzip copy of the student's
+answers, exam results, bookmarks, High Yield marks, streak and goal (`rev`, `hash`, `data` or `chunkCount` + `prefix` with
+parts in `.../chunks`). Owner only (rules). Each sync is a three-way merge (last agreed copy, device, server): answers and
+exams are unions, marks follow what the device added or removed, *Reset My Progress* stores `resetAt`.
 
-**Deletions reach students.** The published bank is the whole bank: after a subscriber installs it, questions that are no longer
-in it (a deleted book, a merged copy) are removed from the device (`removeDeletedQuestions` in the student `subscription.js`);
-answers, bookmarks, notes and High Yield marks made on a removed copy move to the copy of the same question that stays.
+*Changes-only package* (`buildDelta` / `uploadDelta` in `cloud-admin.js`, `applyPartial` in the student's
+`subscription.js`): on Publish the admin downloads the currently published bank, compares item by item (fields and image
+bytes, not the package stamp) and uploads the new and corrected items plus the removed uids as `packs/<id>/chunks/d<version>_NNNN`,
+advertised by `deltaFrom`, `deltaPrefix`, `deltaChunks`, `deltaSha`, `uidDigest` in `packs/<id>`. A student whose device is an
+exact copy of `deltaFrom` installs it and checks its question list against `uidDigest`; anything else (new device, older
+version, failed check, changes larger than 60% of the bank) takes the full bank.
+
+*Board exam*: `settings/board` = `{ json }` with `{ "<specialtyId>": { questions, minutes, mix } }` from the *Board exam
+simulation* card (`readBoard` / `writeBoard`).
+*Overview*: `overviewOf(accounts, payments)` counts students, activity (`users/{uid}.lastSeenAt`), income (live, Activated
+payments) and subscriptions ending within 7 days.
+
+**Corrections from a file (16 Nov 2026).** A file row that is the same question in the same book but differs from the stored
+copy (answer, explanation, classification, difficulty, reference, spelling) is a *Changed* row: `QuestionImport.questionChanges`
+lists the differences and `applyQuestionChanges` writes only those into the stored record on Confirm Import (same id, uid, book,
+Free mark). The Corrections card can untick them all. Identical rows are still skipped.
+The free version's document carries `summary` (JSON: total, categories, books of the full bank; counts only).
+
+**Every book complete (16 Nov 2026).** A book is always imported in full. Only the same question (same text and set of
+options) in the same book, or repeated inside the file, is skipped. A uid in the file is not a duplicate signal: a uid that is
+already used gets a new one on saving. The **Book check** only reports how many questions a new book shares with an existing
+one; a name that differs only in capitals, spacing or punctuation is saved under the stored spelling. Publishing gives every
+item its own uid (two records sharing one would become one record on students' devices). The admin dashboard shows
+**Different questions** (what students see when they study all books) next to the total.
+*Import → Books stored twice* merges two books that are really one (`db.mergeBooks`): a shared question is kept once (the oldest
+record stays, with the details of the latest upload); everything else moves to the chosen name.
+
+**Publish replaces the bank on students' devices.** The published bank is the whole bank: after a subscriber installs it, the
+device becomes an exact copy of it (`mirrorPublishedBank` in the student `subscription.js`), so whatever is not in this workspace
+when you publish disappears for students. Their answers, bookmarks, notes and High Yield marks move to the question with the same
+text and options (or the same text). The free version follows **Publish free version** in the same way (only the published Free
+questions are visible).
 Students see one copy outside book study (see the student README).
 
 **Free questions = the free version.** There is no free trial (since 13 Nov 2026): a student without a subscription sees only the
@@ -136,6 +165,11 @@ contacted on WhatsApp about their account; older accounts are asked once. Use it
 the app (allowed by Google Play's policy), but the Google Play listing and the app itself must not point students to paying outside Google Play.
 
 ### Renaming a book (Admin app)
+
+*Import & Export* → **Delete One Book**: the list offers every book with its question count (a book whose name came from
+inside a JSON file is stored in `book` with an empty `group`, and used to be missing from this list). Deleting removes the
+book's questions (matched on `book` or `group`), its lectures and its book entry (`db.deleteBook`); the confirmation says how
+many of its questions exist in no other book and are therefore lost.
 
 *Import & Export* → **Rename a Book** (next to *Delete One Book*): pick the book, type the new name, confirm. The name is changed in every question
 (`book` and `group`), every lecture and every book entry of the book in the open specialty; extra spaces are tidied. If the new name already belongs to

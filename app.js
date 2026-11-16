@@ -1735,6 +1735,47 @@ const LazyRenderer = {
                 return result;
             }
 
+            // Deletes a whole book: its questions (whether the name is stored in `book`, in `group`, or in both), its
+            // lectures and its book entry. A book name typed in Group Name and a name that came from inside a JSON file
+            // are both found, so every book in the Book list can be deleted.
+            async deleteBook(name) {
+                name = String(name == null ? '' : name).trim();
+                if (!name) throw new Error('Choose the book to delete.');
+                await this.ensureReady();
+                const counts = { questions: 0, lectures: 0, bookMeta: 0 };
+                const stores = ['questions', 'bookmarks', 'notes', 'highYield']
+                    .concat(this.db.objectStoreNames.contains('lectures') ? ['lectures'] : [])
+                    .concat(this.db.objectStoreNames.contains('bookMeta') ? ['bookMeta'] : []);
+                await new Promise((resolve, reject) => {
+                    const tx = this.db.transaction(stores, 'readwrite');
+                    tx.oncomplete = resolve;
+                    tx.onerror = () => reject(tx.error || new Error('The book could not be deleted.'));
+                    tx.onabort = () => reject(tx.error || new Error('The book could not be deleted. Nothing was changed.'));
+                    const same = (value) => typeof value === 'string' && value.trim() === name;
+                    const qs = tx.objectStore('questions');
+                    qs.getAll().onsuccess = (e) => {
+                        try {
+                            for (const q of e.target.result || []) {
+                                if (!same(q.book) && !same(q.group)) continue;
+                                qs.delete(q.id);
+                                ['bookmarks', 'notes', 'highYield'].forEach(n => tx.objectStore(n).delete(q.id));
+                                counts.questions++;
+                            }
+                        } catch (error) { tx.abort(); reject(error); }
+                    };
+                    if (stores.includes('lectures')) {
+                        const ls = tx.objectStore('lectures');
+                        ls.getAll().onsuccess = (e) => { for (const l of e.target.result || []) if (same(l.book)) { ls.delete(l.id); counts.lectures++; } };
+                    }
+                    if (stores.includes('bookMeta')) {
+                        const bs = tx.objectStore('bookMeta');
+                        bs.getAll().onsuccess = (e) => { for (const m of e.target.result || []) if (same(m.title) || same(m.book)) { bs.delete(m.id); counts.bookMeta++; } };
+                    }
+                });
+                this._invalidateCache();
+                return counts;
+            }
+
             async deleteQuestionsByBook(bookName) {
                 this._invalidateCache(['questions', 'groups', 'books', 'bookmarks', 'highYield']);
                 await this.ensureReady();
@@ -2013,6 +2054,7 @@ const db = new ENTDatabase();
             db.clearAndRestore = wrapAdmin(db.clearAndRestore, 'clearAndRestore');
             db.deleteQuestionsByGroup = wrapAdmin(db.deleteQuestionsByGroup, 'deleteQuestionsByGroup');
             db.deleteQuestionsByBook = wrapAdmin(db.deleteQuestionsByBook, 'deleteQuestionsByBook');
+            db.deleteBook = wrapAdmin(db.deleteBook, 'deleteBook');
             db.renameBook = wrapAdmin(db.renameBook, 'renameBook');
             db.mergeBooks = wrapAdmin(db.mergeBooks, 'mergeBooks');
             db.addLecture = wrapAdmin(db.addLecture, 'addLecture');
@@ -2719,23 +2761,6 @@ function generateTopicSubtopic(q, { suggest = false } = {}){
  return q;
 }
 
-// STEP 8 HIERARCHY ANALYTICS ENGINE
-async function buildHierarchyStats(){
- const qs=await db.getAllQuestions();
- const tree={};
- qs.forEach(q=>{
-   const s=q.subject||'Uncategorized';
-   const c=q.chapter||'General';
-   const t=q.topic||'General';
-   const st=q.subtopic||'General';
-   tree[s]??={};
-   tree[s][c]??={};
-   tree[s][c][t]??={};
-   tree[s][c][t][st]=(tree[s][c][t][st]||0)+1;
- });
- return tree;
-}
-
 async function getQuestionsNeedingReview(){
  const qs=await db.getAllQuestions();
  return qs.filter(q=>q.needsReview);
@@ -2755,44 +2780,7 @@ async function scanDuplicateQuestions(){
  return dup;
 }
 
-async function generateSubjectAnalytics(){
- const qs=await db.getAllQuestions();
- const stats={};
- qs.forEach(q=>{
-   const s=q.subject||'Unknown';
-   stats[s]=(stats[s]||0)+1;
- });
- return stats;
-}
-
-// STEP 11 DASHBOARD + AI RECOMMENDATIONS
-async function buildTopicHeatmap(){
- const qs=await db.getAllQuestions();
- const map={};
- qs.forEach(q=>{
-   const k=q.topic||'General';
-   map[k]=(map[k]||0)+1;
- });
- return map;
-}
-
-async function generateWeakAreaRecommendations(){
- const perf=await db.getPerformance();
- const result=[];
- perf.filter(x=>!x.correct).slice(0,20).forEach(x=>{
-   result.push(`${x.subject||'Unknown'} > ${x.chapter||'Unknown'}`);
- });
- return [...new Set(result)];
-}
-
 // STEP 12 INTERACTIVE MANAGEMENT + READINESS ENGINE
-
-async function renderBoardReadinessDashboard(){
- const perf=await db.getPerformance();
- const correct=perf.filter(x=>x.correct).length;
- const score=perf.length?Math.round(correct*100/perf.length):0;
- return `<div class="readiness-card"><h3>${uiIcon("target")} Board Readiness</h3><p>${score}% Ready</p></div>`;
-}
 
 // STEP 13 ADVANCED AI + EXAM CENTER
 
@@ -2801,12 +2789,6 @@ async function renderBoardReadinessDashboard(){
 async function adaptiveExamEngine(){
  const perf=await db.getPerformance();
  return perf.filter(x=>!x.correct).length;
-}
-
-async function performanceForecastEngine(){
- const perf=await db.getPerformance();
- const acc=perf.length?Math.round((perf.filter(x=>x.correct).length*100)/perf.length):0;
- return `Projected Board Score: ${Math.min(acc+10,100)}%`;
 }
 
 // STEP 15 ENTERPRISE RELEASE ENGINE
@@ -3687,6 +3669,11 @@ function openMissingQuestionReferences() {
                 .sort((a, b) => a.p - b.p)
                 .slice(0, 5);
 
+            // What students see when they study all books: a question that is in several books once.
+            const distinctKeys = new Set();
+            let distinct = 0;
+            questions.forEach(q => { const k = QuestionImport.dupKey(q); if (!k) distinct++; else if (!distinctKeys.has(k)) { distinctKeys.add(k); distinct++; } });
+
             // Duplicate scan
             const dupMap = new Map();
             const dups = [];
@@ -3701,6 +3688,7 @@ function openMissingQuestionReferences() {
             <div class="card"><div class="card-header">${uiIcon("settings")} Admin Dashboard</div>
               <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;margin-bottom:14px;">
                 <div class="stat-card"><div class="stat-value">${total}</div><div class="stat-label">Questions</div></div>
+                <div class="stat-card" id="adminDistinctCard" title="A question that is in several books counts once: the number students see when they study all books"><div class="stat-value">${distinct}</div><div class="stat-label">Different questions</div></div>
                 <div class="stat-card"><div class="stat-value">${bookmarks.length}</div><div class="stat-label">Bookmarked</div></div>
                 <div class="stat-card"><div class="stat-value">${history.length}</div><div class="stat-label">Exams</div></div>
                 <div class="stat-card"><div class="stat-value">${correct}</div><div class="stat-label">Correct</div></div>
@@ -4015,23 +4003,6 @@ function openMissingQuestionReferences() {
             await db.setSetting(DAILY_GOAL_KEY, String(goal));
         }
 
-        async function getDailyProgress() {
-            const today = new Date().toISOString().slice(0, 10);
-            const progress = await getDailyProgressMap();
-            return toNonNegativeInteger(progress?.[today]);
-        }
-
-        async function getWeeklyProgress() {
-            const progress = await getDailyProgressMap();
-            const result = [];
-            for (let i = 6; i >= 0; i--) {
-                const d = new Date(); d.setDate(d.getDate() - i);
-                const key = d.toISOString().slice(0, 10);
-                result.push({ date: key, count: toNonNegativeInteger(progress?.[key]), day: d.toLocaleDateString('en-US', { weekday: 'long' }) });
-            }
-            return result;
-        }
-
         async function generateSmartRevision() {
             const [questions, perf, bmIds, hyIds] = await Promise.all([
                 db.getAllQuestions(), db.getPerformance(),
@@ -4335,90 +4306,6 @@ async function renderDashboard() {
               <button class="btn btn-primary btn-block" id="btnStartStudy">${uiIcon("play")} Start Studying</button>
             </div>
             <div id="studyArea"></div>`;
-        }
-
-        async function renderLectureBrowser() {
-            const lectures = await db.getAllLectures();
-            const taxonomy = computeTaxonomy([...(await db.getAllQuestions()), ...lectures]);
-            const sf = AppState.studyFilter;
-            let filtered = lectures;
-            if (sf.subject !== 'all') filtered = filtered.filter(l => (l.subject || 'Uncategorized') === sf.subject);
-            if (sf.chapter !== 'all') filtered = filtered.filter(l => (l.chapter || 'General') === sf.chapter);
-
-            const subjectOpts = '<option value="all">All</option>' + taxonomy.subjects.map(s => `<option value="${escapeHTML(s)}" ${sf.subject===s?'selected':''}>${escapeHTML(s)}</option>`).join('');
-
-            // Chapter options: only chapters that actually have lectures, scoped to the
-            // current subject filter so the list stays short and relevant.
-            const chapterSource = sf.subject !== 'all' ? lectures.filter(l => (l.subject || 'Uncategorized') === sf.subject) : lectures;
-            const chapterSet = new Set(['General']);
-            chapterSource.forEach(l => { chapterSet.add(l.chapter || 'General'); });
-            const chapterOpts = '<option value="all">All Sections</option>' + [...chapterSet].sort().map(c => `<option value="${escapeHTML(c)}" ${sf.chapter===c?'selected':''}>${escapeHTML(c)}</option>`).join('');
-
-            return `
-            <div class="card">
-              <div class="card-header">${uiIcon("library")} Lectures</div>
-              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
-                <button class="btn btn-sm btn-outline" data-study-mode="practice">${uiIcon("arrow-left")} Back to Study</button>
-                ${RBAC.isAdmin() ? `<button class="btn btn-sm btn-primary" id="btnAddLecture">${uiIcon("plus")} Add Lecture</button>` : ''}
-              </div>
-              <div class="form-row">
-                <div><label>Category</label><select id="lectureSubjectFilter">${subjectOpts}</select></div>
-                <div><label>Section</label><select id="lectureChapterFilter">${chapterOpts}</select></div>
-              </div>
-              <p style="font-size:0.85rem;color:var(--text2);">${filtered.length} lectures</p>
-            </div>
-            ${filtered.length === 0 ? '<div class="empty-state">No lectures yet. Add your first lecture above.</div>' :
-              filtered.map(l => `
-                <div class="card lecture-card" data-lid="${escapeHTML(l.id)}" style="cursor:pointer;">
-                  <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-                    <div>
-                      <div style="font-weight:700;font-size:1.05rem;margin-bottom:6px;">${escapeHTML(l.title || 'Untitled')}</div>
-                      <div class="flex-wrap">
-                        <span class="badge badge-primary">${escapeHTML(l.subject || 'Uncategorized')}</span>
-                        <span class="badge badge-accent">${escapeHTML(l.chapter || 'General')}</span>
-                        ${l.book ? `<span class="badge badge-group">${escapeHTML(l.book)}</span>` : ''}
-                      </div>
-                    </div>
-                    <button class="btn btn-sm btn-outline lecture-exam-btn" data-lid="${escapeHTML(l.id)}" style="white-space:nowrap;">${uiIcon("exam")} Exam</button>
-                  </div>
-                  <div style="margin-top:10px;font-size:0.82rem;color:var(--text2);line-height:1.5;max-height:60px;overflow:hidden;position:relative;">
-                    ${escapeHTML((l.content || '').substring(0, 180))}${(l.content || '').length > 180 ? '…' : ''}
-                  </div>
-                </div>
-              `).join('')}`;
-        }
-
-        async function renderLectureReader(lectureId) {
-            const l = await db.getLecture(lectureId);
-            if (!l) return ("<div class=\"card text-center\"><h3>Lecture not found</h3><button class=\"btn btn-outline\" data-study-mode=\"lectures\">" + uiIcon("arrow-left") + " Back</button></div>");
-            const allQuestions = await db.getAllQuestions();
-            const attachedCount = allQuestions.filter(q => q.lectureId === l.id).length;
-            const chapterCount = allQuestions.filter(q => (q.subject||'') === (l.subject||'') && (q.chapter||'') === (l.chapter||'')).length;
-            return `
-            <div class="card">
-              <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;">
-                <div>
-                  <div class="card-header" style="margin-bottom:4px;">${escapeHTML(l.title || 'Untitled')}</div>
-                  <div class="flex-wrap">
-                    <span class="badge badge-primary">${escapeHTML(l.subject || 'Uncategorized')}</span>
-                    <span class="badge badge-accent">${escapeHTML(l.chapter || 'General')}</span>
-                    ${l.book ? `<span class="badge badge-group">${escapeHTML(l.book)}</span>` : ''}
-                    ${l.page ? `<span class="badge badge-warning">${uiIcon("file")} Page ${escapeHTML(String(l.page))}</span>` : ''}
-                  </div>
-                </div>
-                <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                  <button class="btn btn-sm btn-outline" data-study-mode="lectures">${uiIcon("arrow-left")} Back</button>
-                  ${RBAC.isAdmin() ? `<button class="btn btn-sm btn-danger" id="btnDeleteLecture" data-lid="${escapeHTML(l.id)}">${uiIcon("trash")} Delete</button>` : ''}
-                </div>
-              </div>
-            </div>
-            <div class="card" style="line-height:1.8;font-size:0.95rem;white-space:pre-wrap;">${escapeHTML(l.content || 'No content.')}</div>
-            <div class="card">
-              <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;">
-                <button class="btn btn-accent" id="btnExamLectureAttached" data-lid="${escapeHTML(l.id)}">${uiIcon("exam")} Exam: This Lecture's MCQs (${attachedCount})</button>
-                <button class="btn btn-primary" id="btnExamChapterAllBooks" data-subj="${escapeHTML(l.subject||'')}" data-chap="${escapeHTML(l.chapter||'')}">${uiIcon("library")} Exam: All MCQs, This Section (${chapterCount})</button>
-              </div>
-            </div>`;
         }
 
         async function renderExamSetup() {
@@ -5519,13 +5406,13 @@ const QuestionImport = (() => {
 
     /** Mutates and returns rows. Only a selected row reserves a within-file duplicate key. */
     function recheckRows(rows, existingQuestions = [], groupName = '') {
-        const existingText = new Map(), existingUid = new Map(), existingAny = new Set();
+        const existingText = new Map(), existingUid = new Map(), existingAny = new Set(), existingByText = new Map();
         for (const q of existingQuestions) {
             const anyBook = dupKey(q);
             if (anyBook) existingAny.add(anyBook);
             const text = anyBook ? bookKey(q) + '\u0000' + anyBook : '';
             const label = q.id == null ? 'existing question' : `question ${q.id}`;
-            if (text) existingText.set(text, label + ' in the same book');
+            if (text && !existingText.has(text)) { existingText.set(text, label + ' in the same book'); existingByText.set(text, q); }
             if (typeof q.uid === 'string' && q.uid.trim()) existingUid.set(q.uid.trim(), { label, book: bookKey(q) });
         }
         const fileText = new Map(), fileUid = new Map();
@@ -5533,16 +5420,24 @@ const QuestionImport = (() => {
             row.errors = [...new Set([...(row.sourceErrors || []), ...validateQuestion(row.question)])];
             row.duplicateOf = null;
             row.otherBookCopy = false;
+            row.updateOf = null;
             const text = sameBookKey(row.question, groupName);
             const uid = typeof row.question.uid === 'string' ? row.question.uid.trim() : '';
             const uidHit = uid ? existingUid.get(uid) : null;
             if (!row.errors.length) {
-                if (text && existingText.has(text)) row.duplicateOf = { kind: 'existing', label: 'Already in this book (' + existingText.get(text) + ')' };
-                else if (uidHit && uidHit.book === bookKey(row.question, groupName)) row.duplicateOf = { kind: 'uid', label: 'Already in this book (' + uidHit.label + ')' };
-                else if (text && fileText.has(text)) row.duplicateOf = { kind: 'file', label: `Repeated in this file (row ${fileText.get(text)})` };
-                else if (uid && fileUid.has(uid)) row.duplicateOf = { kind: 'file', label: `Repeated in this file (row ${fileUid.get(uid)})` };
+                // A duplicate is the same question (same text and options) in the SAME book, nothing else. An id (uid)
+                // in the file that another question already uses does not make it a duplicate: it gets a new id on saving.
+                if (text && fileText.has(text)) row.duplicateOf = { kind: 'file', label: `Repeated in this file (row ${fileText.get(text)})` };
+                else if (text && existingText.has(text)) {
+                    // Already in this book. Identical: skipped. Corrected in the file (answer, explanation, classification,
+                    // spelling): the stored question is UPDATED in place, so students keep their progress on it.
+                    const stored = existingByText.get(text);
+                    const changes = stored && stored.id != null ? questionChanges(stored, row.question) : [];
+                    if (changes.length) row.updateOf = { id: stored.id, changes };
+                    else row.duplicateOf = { kind: 'existing', label: 'Already in this book (' + existingText.get(text) + ')' };
+                }
                 // Also in ANOTHER book: imported anyway (students studying that book see it), shown once elsewhere.
-                if (!row.duplicateOf && (uidHit || existingAny.has(dupKey(row.question)))) row.otherBookCopy = true;
+                if (!row.duplicateOf && existingAny.has(dupKey(row.question))) row.otherBookCopy = true;
             }
             if (row.errors.length || row.duplicateOf) row.selected = false;
             if (row.selected && !row.errors.length && !row.duplicateOf) {
@@ -5553,9 +5448,56 @@ const QuestionImport = (() => {
         return rows;
     }
 
+    // What a file row would change in the stored copy of the same question. Empty = identical.
+    const CLASS_FIELDS = ['subject', 'chapter', 'topic', 'subtopic'];
+    const REF_FIELDS = ['referenceName', 'referenceEdition', 'referencePage'];
+    function questionChanges(stored, incoming) {
+        const str = v => (v == null ? '' : String(v)).replace(/\s+/g, ' ').trim();
+        const short = v => { const t = str(v); return t.length > 60 ? t.slice(0, 57) + '…' : t; };
+        const answerText = q => str(q['option' + String(q.correctAnswer || '').toUpperCase()]);
+        const options = q => ['A', 'B', 'C', 'D', 'E'].map(l => str(q['option' + l])).filter(Boolean).sort().join('\u0001');
+        const out = [];
+        if (normalizeText(answerText(stored)) !== normalizeText(answerText(incoming))) {
+            out.push({ field: 'answer', label: 'Answer', from: short(answerText(stored)), to: short(answerText(incoming)) });
+        }
+        if (str(stored.questionText) !== str(incoming.questionText) || options(stored) !== options(incoming)) {
+            out.push({ field: 'text', label: 'Spelling of the question or options', from: '', to: '' });
+        }
+        if (str(stored.explanation) !== str(incoming.explanation)) out.push({ field: 'explanation', label: 'Explanation', from: short(stored.explanation), to: short(incoming.explanation) });
+        const cls = CLASS_FIELDS.filter(f => str(stored[f]) !== str(incoming[f]));
+        if (cls.length) out.push({ field: 'classification', label: 'Classification', from: CLASS_FIELDS.map(f => str(stored[f])).filter(Boolean).join(' › '), to: CLASS_FIELDS.map(f => str(incoming[f])).filter(Boolean).join(' › ') });
+        if (str(incoming.difficulty) && str(stored.difficulty) !== str(incoming.difficulty)) out.push({ field: 'difficulty', label: 'Difficulty', from: str(stored.difficulty), to: str(incoming.difficulty) });
+        if (REF_FIELDS.some(f => str(incoming[f]) && str(stored[f]) !== str(incoming[f]))) {
+            out.push({ field: 'reference', label: 'Reference', from: REF_FIELDS.map(f => str(stored[f])).filter(Boolean).join(', '), to: REF_FIELDS.map(f => str(incoming[f])).filter(Boolean).join(', ') });
+        }
+        return out;
+    }
+
+    // Copies into the stored record only what the file changed (the record keeps its id, uid, book, Free mark and dates).
+    function applyQuestionChanges(stored, incoming, changes) {
+        const merged = Object.assign({}, stored);
+        const fields = new Set(changes.map(c => c.field));
+        if (fields.has('answer') || fields.has('text')) {
+            // The letters belong to the order of the options, so text, options and answer always move together.
+            merged.questionText = incoming.questionText;
+            for (const l of ['A', 'B', 'C', 'D', 'E']) merged['option' + l] = incoming['option' + l] == null ? '' : incoming['option' + l];
+            merged.correctAnswer = incoming.correctAnswer;
+        }
+        if (fields.has('explanation')) merged.explanation = incoming.explanation == null ? '' : incoming.explanation;
+        if (fields.has('classification')) {
+            for (const key of Object.keys(incoming)) {
+                if (CLASS_FIELDS.includes(key) || /^classification/.test(key) || ['subjectId', 'chapterId', 'chapterNumber', 'partId', 'needsReview'].includes(key)) merged[key] = incoming[key];
+            }
+        }
+        if (fields.has('difficulty')) merged.difficulty = incoming.difficulty;
+        if (fields.has('reference')) for (const f of REF_FIELDS) if (incoming[f] != null && String(incoming[f]).trim()) merged[f] = incoming[f];
+        return merged;
+    }
+
     function summarize(rows) {
-        const result = { total: rows.length, ready: 0, review: 0, invalid: 0, duplicates: 0, selected: 0, excluded: 0 };
+        const result = { total: rows.length, ready: 0, review: 0, invalid: 0, duplicates: 0, selected: 0, excluded: 0, changed: 0, changedSelected: 0 };
         for (const row of rows) {
+            if (!row.errors.length && row.updateOf) { result.changed++; if (row.selected) result.changedSelected++; }
             if (row.errors.length) result.invalid++;
             else if (row.duplicateOf) result.duplicates++;
             else if (isQuestionClassificationApproved(row.question)) result.ready++;
@@ -5612,7 +5554,7 @@ const QuestionImport = (() => {
         return out;
     }
 
-    return { parse, parseCSV, normalizeText, dupKey, bookKey, sameBookKey, validateQuestion, prepareRows, recheckRows, summarize, bookMatches, bookNameOf };
+    return { parse, parseCSV, normalizeText, dupKey, bookKey, sameBookKey, validateQuestion, prepareRows, recheckRows, summarize, bookMatches, bookNameOf, questionChanges, applyQuestionChanges };
 })();
 
 
@@ -5630,6 +5572,7 @@ function importPreviewEscape(value) {
 function importPreviewRowStatus(row) {
     if (row.errors.length) return 'invalid';
     if (row.duplicateOf) return 'duplicates';
+    if (row.updateOf) return 'changed';
     return isQuestionClassificationApproved(row.question) ? 'ready' : 'review';
 }
 
@@ -5709,7 +5652,8 @@ async function beginQuestionImportPreview() {
             filter: 'all',
             step: 'preview',
             busy: false,
-            bookMatches: QuestionImport.bookMatches(rows, existingQuestions, groupName).map(m => Object.assign(m, { choice: null }))
+            // A book is always imported in full: sharing questions with another book is only reported.
+            bookMatches: QuestionImport.bookMatches(rows, existingQuestions, groupName).map(m => Object.assign(m, { choice: m.kind === 'content' ? 'separate' : null }))
         };
         // The same name with other capitals, spacing or punctuation is the same book: it keeps the stored spelling.
         ImportPreviewState.bookMatches.filter(m => m.kind === 'name').forEach(m => setImportBookChoice(ImportPreviewState, m, 'same'));
@@ -5762,8 +5706,7 @@ function importBookBannerHTML(state, disabled) {
                 <button type="button" class="btn btn-outline btn-sm" data-import-action="book-change" data-book-index="${i}" ${disabled}>Change</button></div>`;
         }
         if (m.choice === 'separate') {
-            return `<div class="import-book-item"><p style="margin:0 0 6px;"><strong>Different book.</strong> «${e(m.incoming)}» is imported as its own book with all ${m.total} question(s). ${m.shared} of them are also in «${e(m.existing)}»; students see those once outside book study.</p>
-                <button type="button" class="btn btn-outline btn-sm" data-import-action="book-change" data-book-index="${i}" ${disabled}>Change</button></div>`;
+            return `<div class="import-book-item"><p style="margin:0;">«${e(m.incoming)}» is imported as its own book with all ${m.total} of its question(s). ${m.shared} of them are also in «${e(m.existing)}»: students see every one of them when they study «${e(m.incoming)}», and see them once when they study all books, a category or a topic.</p></div>`;
         }
         return `<div class="import-book-item"><p style="margin:0 0 6px;"><strong>«${e(m.incoming)}»</strong> looks like your book <strong>«${e(m.existing)}»</strong>: ${m.shared} of its ${m.total} question(s) are already in «${e(m.existing)}». Is it the same book?</p>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -5794,6 +5737,7 @@ function renderQuestionImportPreview() {
         <span class="badge badge-warning">Needs review: ${summary.review}</span>
         <span class="badge badge-danger">Invalid: ${summary.invalid}</span>
         <span class="badge badge-warning">Duplicates: ${summary.duplicates}</span>
+        ${summary.changed ? `<span class="badge badge-accent" id="importChangedBadge">Changed: ${summary.changed}</span>` : ''}
         <span class="badge badge-accent">Selected: ${selectedRows.length}</span>
         <span class="badge badge-group">Excluded: ${summary.total - selectedRows.length}</span>
     </div>`;
@@ -5802,7 +5746,7 @@ function renderQuestionImportPreview() {
         area.innerHTML = `${importPreviewLayoutStyle()}<div class="card" id="importConfirmationCard" aria-busy="${busy}">
             <div class="card-header">Confirm Question Import — تأكيد الاستيراد</div>
             ${progress}
-            <p><strong>${selectedRows.length}</strong> question(s) selected for addition to the administrator's question bank.</p>
+            <p><strong>${selectedRows.length - summary.changedSelected}</strong> question(s) will be added to the administrator's question bank${summary.changedSelected ? `, and <strong>${summary.changedSelected}</strong> stored question(s) will be updated from the file` : ''}.</p>
             <ul style="margin:12px 0;padding-inline-start:24px;">
                 <li>${selectedReady} with approved classifications.</li>
                 <li>${selectedReview} need Classification Review after import. Exports include all valid questions and preserve their classification and review status.</li>
@@ -5833,15 +5777,16 @@ function renderQuestionImportPreview() {
     const pageCount = Math.max(1, Math.ceil(filtered.length / state.pageSize));
     state.page = Math.max(0, Math.min(state.page, pageCount - 1));
     const displayed = filtered.slice(state.page * state.pageSize, (state.page + 1) * state.pageSize);
-    const filters = [['all', 'All rows'], ['ready', 'Ready'], ['review', 'Needs classification review'], ['invalid', 'Invalid data'], ['duplicates', 'Duplicates']];
+    const filters = [['all', 'All rows'], ['ready', 'Ready'], ['changed', 'Changed (will be updated)'], ['review', 'Needs classification review'], ['invalid', 'Invalid data'], ['duplicates', 'Duplicates']];
     const rowHtml = row => {
         const q = row.question;
         const status = importPreviewRowStatus(row);
         const blocked = row.errors.length > 0 || !!row.duplicateOf;
-        const messages = (row.errors.length ? row.errors : row.duplicateOf ? [row.duplicateOf.label] : status === 'review' ? ['Classification needs approval before publication to students.'] : [])
+        const changeLines = status === 'changed' ? ['Already in this book: it will be UPDATED from the file.'].concat(row.updateOf.changes.map(c => c.from || c.to ? `${c.label}: ${c.from || '(empty)'} → ${c.to || '(empty)'}` : c.label)) : null;
+        const messages = (row.errors.length ? row.errors : row.duplicateOf ? [row.duplicateOf.label] : changeLines ? changeLines : status === 'review' ? ['Classification needs approval before publication to students.'] : [])
             .concat(!row.errors.length && !row.duplicateOf && row.otherBookCopy ? ['Also in another book: imported for this book; students see it once outside book study.'] : []);
-        const badge = status === 'ready' ? 'Ready' : status === 'review' ? 'Needs Review' : status === 'invalid' ? 'Invalid' : 'Duplicate';
-        const badgeClass = status === 'ready' ? 'badge-primary' : status === 'invalid' ? 'badge-danger' : 'badge-warning';
+        const badge = status === 'ready' ? 'Ready' : status === 'changed' ? 'Changed' : status === 'review' ? 'Needs Review' : status === 'invalid' ? 'Invalid' : 'Duplicate';
+        const badgeClass = status === 'ready' ? 'badge-primary' : status === 'changed' ? 'badge-accent' : status === 'invalid' ? 'badge-danger' : 'badge-warning';
         return `<tr data-import-row="${row.key}" style="vertical-align:top;${row.selected ? '' : 'opacity:0.8;'}">
             <td style="padding:10px;border-bottom:1px solid var(--border);"><input type="checkbox" data-import-row-key="${row.key}" aria-label="Include question ${row.sourceIndex}" ${row.selected ? 'checked' : ''} ${blocked || busy ? 'disabled' : ''}></td>
             <td style="padding:10px;border-bottom:1px solid var(--border);">${row.sourceIndex}</td>
@@ -5883,6 +5828,13 @@ function renderQuestionImportPreview() {
         <div class="card-header">Question Import Preview — معاينة الاستيراد</div>
         <p style="color:var(--text2);">Review the questions, exclude rows and edit classifications. Changes on this screen are saved only after Confirm Import.</p>
         ${importBookBannerHTML(state, disabled)}
+        ${summary.changed ? `<div class="card" style="border-color:var(--primary);margin:0 0 12px;" id="importChangedReport">
+            <div style="font-weight:700;margin-bottom:6px;">Corrections — تصحيحات</div>
+            <p style="margin:0 0 8px;">${summary.changed} question(s) of this file are already in the book, but the file differs (answer, explanation, classification or spelling). ${summary.changedSelected ? `<strong>${summary.changedSelected} will be updated from the file.</strong>` : '<strong>None will be updated.</strong>'} Students keep their progress on them. Use the “Changed” filter to see each difference.</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              ${summary.changedSelected ? `<button type="button" class="btn btn-outline btn-sm" data-import-action="changed-none" ${disabled}>Do not update them</button>` : ''}
+              ${summary.changedSelected < summary.changed ? `<button type="button" class="btn btn-primary btn-sm" data-import-action="changed-all" ${disabled}>Update all ${summary.changed}</button>` : ''}
+            </div></div>` : ''}
         ${taxBanner}
         ${progress}
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
@@ -5932,6 +5884,12 @@ function renderQuestionImportPreview() {
         const action = button.dataset.importAction;
         if (action === 'edit') { editImportPreviewClassification(Number(button.dataset.importKey)); return; }
         if (action === 'add-missing-tax') { addImportGapsToTaxonomy(); return; }
+        if (action === 'changed-none' || action === 'changed-all') {
+            for (const row of ImportPreviewState.rows) if (row.updateOf && !row.errors.length) row.selected = action === 'changed-all';
+            ImportPreviewState.rows = QuestionImport.recheckRows(ImportPreviewState.rows, ImportPreviewState.existingQuestions, ImportPreviewState.groupName);
+            renderQuestionImportPreview();
+            return;
+        }
         if (action === 'book-same' || action === 'book-separate' || action === 'book-change') {
             const match = (ImportPreviewState.bookMatches || [])[Number(button.dataset.bookIndex)];
             if (match && match.kind === 'content') {
@@ -6065,7 +6023,7 @@ function showQuestionImportResult(result) {
     area.onchange = null;
     area.innerHTML = `${importPreviewLayoutStyle()}<div class="card" id="importResultCard" role="status">
         <div class="card-header">Import Complete — اكتمل الاستيراد</div>
-        <p><strong>${added}</strong> question(s) added.</p>
+        <p><strong>${added}</strong> question(s) added.${Number(result.updated || 0) ? ` <strong>${Number(result.updated)}</strong> stored question(s) updated from the file. Press Publish so students get the corrections.` : ''}</p>
         <p style="margin-top:8px;">${review} need classification review. Exports include all valid questions and preserve their classification and review status. ${duplicates} duplicate(s) skipped. ${excluded} row(s) excluded.</p>
         <button type="button" class="btn btn-outline" id="btnCloseImportResult" style="margin-top:14px;">Close Result</button>
     </div>`;
@@ -6074,7 +6032,8 @@ function showQuestionImportResult(result) {
 
 
 // The preview stays in memory. Only this final, atomic transaction changes the question bank.
-async function saveQuestionImport(questions, groupName = '') {
+// updateIds[i] = id of the stored question that questions[i] corrects (same question, same book), or null for a new one.
+async function saveQuestionImport(questions, groupName = '', updateIds = []) {
     if (!RBAC.requireAdmin()) throw new Error('Admin access required.');
     await db.ensureReady();
     const prepared = questions.map(question => {
@@ -6095,11 +6054,11 @@ async function saveQuestionImport(questions, groupName = '') {
         q.book = q.book || '';
         return q;
     });
-    if (!prepared.length) return { added: 0, skippedDuplicates: 0, selected: 0, review: 0 };
+    if (!prepared.length) return { added: 0, updated: 0, skippedDuplicates: 0, selected: 0, review: 0 };
     return new Promise((resolve, reject) => {
         const tx = db.db.transaction('questions', 'readwrite');
         const store = tx.objectStore('questions');
-        const result = { added: 0, skippedDuplicates: 0, selected: prepared.length, review: 0 };
+        const result = { added: 0, updated: 0, skippedDuplicates: 0, selected: prepared.length, review: 0 };
         let failure;
         const existing = store.getAll();
         existing.onsuccess = () => {
@@ -6107,14 +6066,29 @@ async function saveQuestionImport(questions, groupName = '') {
                 if (!RBAC.isAdmin()) throw new Error('Admin access required.');
                 const textKeys = new Set(existing.result.map(q => QuestionImport.sameBookKey(q)).filter(Boolean));
                 const uids = new Map(existing.result.filter(q => typeof q.uid === 'string' && q.uid.trim()).map(q => [q.uid.trim(), QuestionImport.bookKey(q)]));
-                for (const q of prepared) {
+                const byId = new Map(existing.result.map(q => [q.id, q]));
+                for (let index = 0; index < prepared.length; index++) {
+                    const q = prepared[index];
                     const key = QuestionImport.sameBookKey(q);
                     const uidBook = q.uid ? uids.get(q.uid) : undefined;
-                    if ((key && textKeys.has(key)) || (uidBook !== undefined && uidBook === QuestionImport.bookKey(q))) {
+                    const stored = updateIds[index] != null ? byId.get(updateIds[index]) : null;
+                    if (stored && key && QuestionImport.sameBookKey(stored) === key) {
+                        // A correction of a stored question: only what the file changed is written, in place.
+                        const changes = QuestionImport.questionChanges(stored, q);
+                        if (changes.length) {
+                            const merged = QuestionImport.applyQuestionChanges(stored, q, changes);
+                            merged.updatedAt = q.updatedAt;
+                            store.put(merged);
+                            result.updated++;
+                            if (!isQuestionClassificationApproved(merged)) result.review++;
+                        } else result.skippedDuplicates++;
+                        continue;
+                    }
+                    if (key && textKeys.has(key)) {                    // the same question in the same book
                         result.skippedDuplicates++;
                         continue;
                     }
-                    if (uidBook !== undefined) q.uid = '';            // same question in another book: its own record and uid
+                    if (uidBook !== undefined) q.uid = '';            // its id is already used: it gets its own record and id
                     if (!q.uid) q.uid = __entUpdatePkg.genUid();
                     if (key) textKeys.add(key);
                     uids.set(q.uid, QuestionImport.bookKey(q));
@@ -6146,12 +6120,12 @@ async function confirmQuestionImport() {
     const sourceControls = ['importData', 'importFormat', 'importGroup', 'importFile', 'btnImport'];
     sourceControls.forEach(id => { const el = document.getElementById(id); if (el) el.disabled = true; });
     try {
-        const result = await saveQuestionImport(selected.map(row => row.question), state.groupName);
+        const result = await saveQuestionImport(selected.map(row => row.question), state.groupName, selected.map(row => (row.updateOf ? row.updateOf.id : null)));
         // The source can be retained to correct excluded/invalid rows in a new preview.
         showQuestionImportResult({ ...summary, ...result, requested: selected.length,
             duplicates: summary.duplicates + result.skippedDuplicates,
             excluded: summary.excluded + result.skippedDuplicates });
-        showToast(`Imported ${result.added} question(s).${result.skippedDuplicates ? ' Skipped ' + result.skippedDuplicates + ' new duplicate(s).' : ''}`, 'success');
+        showToast(`Imported ${result.added} question(s).${result.updated ? ' Updated ' + result.updated + '.' : ''}${result.skippedDuplicates ? ' Skipped ' + result.skippedDuplicates + ' new duplicate(s).' : ''}`, 'success');
     } catch (error) {
         state.busy = false;
         state.error = error.message;
@@ -6558,12 +6532,27 @@ async function confirmQuestionImport() {
             populateDeleteBookDropdown();
             const delGroupBtn = $('#btnDeleteGroup');
             if (delGroupBtn) delGroupBtn.addEventListener('click', async () => {
-                const groupName = ($('#deleteGroupName')?.value || '').trim();
-                if (!groupName) { alert('Enter book/group name'); return; }
-                if (!confirm(`Delete all questions from "${groupName}" only?`)) return;
-                const deleted = await db.deleteQuestionsByGroup(groupName);
-                showToast(`${deleted} questions deleted from ${groupName}`, 'success');
-                renderViewSafely('import');
+                if (!RBAC.requireAdmin()) return;
+                const name = ($('#deleteGroupName')?.value || '').trim();
+                if (!name) { showToast('Choose the book to delete.', 'warning'); return; }
+                const all = await db.getAllQuestions();
+                const inBook = all.filter(q => (typeof q.book === 'string' && q.book.trim() === name) || (typeof q.group === 'string' && q.group.trim() === name));
+                const onlyHere = inBook.filter(q => { const key = QuestionImport.dupKey(q); return !key || !all.some(o => o.id !== q.id && QuestionImport.dupKey(o) === key); }).length;
+                if (!inBook.length) { showToast(`"${name}" has no questions.`, 'info'); renderViewSafely('import'); return; }
+                if (!confirm(`Delete the book "${name}"?\n\n` +
+                    `    ${inBook.length} question(s) in this book\n` +
+                    `    ${onlyHere} of them are in no other book and are lost\n` +
+                    `    ${inBook.length - onlyHere} also exist in another book and stay there\n\n` +
+                    'Students lose these questions after you press Publish. This cannot be undone.')) return;
+                try {
+                    const done = await db.deleteBook(name);
+                    if (!done) return;   // refused (archived specialty): a message was already shown
+                    if (AppState.studyFilter && AppState.studyFilter.book === name) AppState.studyFilter.book = 'all';
+                    showToast(`"${name}" deleted: ${done.questions} question(s)${done.lectures ? ', ' + done.lectures + ' lecture(s)' : ''}. Press Publish so students get the change.`, 'success');
+                    renderViewSafely('import');
+                } catch (error) {
+                    showToast('Could not delete the book: ' + (error && error.message ? error.message : error), 'error');
+                }
             });
 
             const sameBooksBtn = $('#btnFindSameBooks');
@@ -6966,16 +6955,13 @@ async function confirmQuestionImport() {
         }
 
         async function populateDeleteBookDropdown(){
+            // Both lists use the same source: every book name in use, whether it is stored in `book` or in `group`.
+            const names=await listBookNames();
+            const options='<option value="">Select Book</option>'+names.map(n=>`<option value="${escapeHTML(n.name)}">${escapeHTML(n.name)} (${n.count})</option>`).join('');
             const sel=document.getElementById('deleteGroupName');
-            if(sel){
-                const groups=await db.getAllGroups();
-                sel.innerHTML='<option value="">Select Book</option>'+groups.map(g=>`<option value="${escapeHTML(g)}">${escapeHTML(g)}</option>`).join('');
-            }
+            if(sel) sel.innerHTML=options;
             const renameSel=document.getElementById('renameBookOld');
-            if(renameSel){
-                const names=await listBookNames();
-                renameSel.innerHTML='<option value="">Select Book</option>'+names.map(n=>`<option value="${escapeHTML(n.name)}">${escapeHTML(n.name)} (${n.count})</option>`).join('');
-            }
+            if(renameSel) renameSel.innerHTML=options;
         }
 
         document.addEventListener('click', async (e)=>{

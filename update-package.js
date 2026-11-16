@@ -1095,9 +1095,12 @@
     /** Assigns + persists a uid to any local item that doesn't have one yet (so future exports stay stable). */
     async function ensureLocalUidsAndStamp(items, storeName, packageVersion) {
         const toPersist = [];
+        const seen = new Set();
         for (const it of items) {
             let changed = false;
-            if (!it.uid) { it.uid = genUid(); changed = true; }
+            // Two records sharing one uid would be merged into ONE on students' devices: the later one gets its own.
+            if (!it.uid || seen.has(it.uid)) { it.uid = genUid(); changed = true; }
+            seen.add(it.uid);
             if (it.pkgVersion !== packageVersion) { it.pkgVersion = packageVersion; changed = true; }
             if (changed) toPersist.push(it);
         }

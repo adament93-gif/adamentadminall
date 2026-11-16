@@ -191,17 +191,20 @@
   /* ------------------------------------------------------------------ subscription scope */
 
   var DEFAULT_TRIAL_DAYS = 0; // no free trial since 13 Nov 2026 (the rules ignore trialDays)
-  var accessSettings = { scope: 'selected', trialDays: DEFAULT_TRIAL_DAYS };
+  var DEFAULT_MAX_DEVICES = 2, DEFAULT_SWAP_DAYS = 7;
+  var accessSettings = { scope: 'selected', trialDays: DEFAULT_TRIAL_DAYS, maxDevices: DEFAULT_MAX_DEVICES, deviceSwapDays: DEFAULT_SWAP_DAYS };
 
   // settings/access: who an active subscription covers and how long a new account's free trial lasts.
   async function readAccess() {
     var tk = await token();
-    var out = { scope: 'selected', trialDays: DEFAULT_TRIAL_DAYS };
+    var out = { scope: 'selected', trialDays: DEFAULT_TRIAL_DAYS, maxDevices: DEFAULT_MAX_DEVICES, deviceSwapDays: DEFAULT_SWAP_DAYS };
     try {
       var d = await request(FS + '/settings/access', { headers: authHeaders(tk) });
       var f = d.fields || {};
       out.scope = strOf(f.subscriptionScope) === 'all' ? 'all' : 'selected';
       if (f.trialDays && f.trialDays.integerValue != null) out.trialDays = Math.max(0, Number(f.trialDays.integerValue));
+      if (f.maxDevices && f.maxDevices.integerValue != null) out.maxDevices = Number(f.maxDevices.integerValue);
+      if (f.deviceSwapDays && f.deviceSwapDays.integerValue != null) out.deviceSwapDays = Number(f.deviceSwapDays.integerValue);
     } catch (e) { if (e.status !== 404) throw e; }
     accessSettings = out;
     return out;
@@ -225,8 +228,45 @@
     await request(FS + '/settings/access?' + mask.map(function (m) { return 'updateMask.fieldPaths=' + m; }).join('&'), {
       method: 'PATCH', headers: authHeaders(tk, true), body: JSON.stringify({ fields: fields })
     });
-    accessSettings = { scope: scope, trialDays: fields.trialDays ? Number(trialDays) : accessSettings.trialDays };
+    accessSettings = Object.assign({}, accessSettings, { scope: scope, trialDays: fields.trialDays ? Number(trialDays) : accessSettings.trialDays });
     return scope;
+  }
+
+  // How many devices an account works on, and how often a student may replace one. Enforced by the Firestore rules.
+  async function writeDeviceLimits(maxDevices, swapDays) {
+    var max = Number(maxDevices), days = Number(swapDays);
+    if (!isFinite(max) || Math.floor(max) !== max || max < 1 || max > 10) throw new Error('Devices per account must be a whole number from 1 to 10.');
+    if (!isFinite(days) || Math.floor(days) !== days || days < 0 || days > 90) throw new Error('Days between replacements must be a whole number from 0 to 90.');
+    var current = await readAccess();
+    var mask = ['subscriptionScope', 'maxDevices', 'deviceSwapDays', 'updatedAt'];
+    var tk = await token();
+    await request(FS + '/settings/access?' + mask.map(function (m) { return 'updateMask.fieldPaths=' + m; }).join('&'), {
+      method: 'PATCH', headers: authHeaders(tk, true),
+      body: JSON.stringify({ fields: { subscriptionScope: sv(current.scope), maxDevices: iv(max), deviceSwapDays: iv(days), updatedAt: tv(new Date().toISOString()) } })
+    });
+    accessSettings = Object.assign({}, accessSettings, { maxDevices: max, deviceSwapDays: days });
+    return accessSettings;
+  }
+
+  // The devices of one account (devices/{uid}): [{ id, label, addedAt }], oldest first.
+  async function readDevices(uid) {
+    var tk = await token();
+    try {
+      var d = await request(FS + '/devices/' + encodeURIComponent(uid), { headers: authHeaders(tk) });
+      var f = d.fields || {};
+      var info = (f.info && f.info.mapValue && f.info.mapValue.fields) || {};
+      var ids = ((f.ids && f.ids.arrayValue && f.ids.arrayValue.values) || []).map(strOf).filter(Boolean);
+      return { lastSwapAt: tsMs(f.lastSwapAt) || 0, list: ids.map(function (id) {
+        var m = (info[id] && info[id].mapValue && info[id].mapValue.fields) || {};
+        return { id: id, label: strOf(m.label) || 'Device', addedAt: tsMs(m.addedAt) || 0 };
+      }).sort(function (a, b) { return a.addedAt - b.addedAt; }) };
+    } catch (e) { if (e.status === 404) return { lastSwapAt: 0, list: [] }; throw e; }
+  }
+
+  async function resetDevices(uid) {
+    var tk = await token();
+    try { await request(FS + '/devices/' + encodeURIComponent(uid), { method: 'DELETE', headers: authHeaders(tk) }); }
+    catch (e) { if (e.status !== 404) throw e; }
   }
 
   /* ------------------------------------------------------------------ publishing */
@@ -235,7 +275,8 @@
     var f = (doc && doc.fields) || {};
     return { version: strOf(f.version), prefix: strOf(f.prefix), chunkCount: intOf(f.chunkCount), gzBytes: intOf(f.gzBytes),
       rawBytes: intOf(f.rawBytes), questions: intOf(f.questions), specialtyId: strOf(f.specialtyId), specialtyName: strOf(f.specialtyName),
-      updatedAt: f.updatedAt && f.updatedAt.timestampValue || '' };
+      updatedAt: f.updatedAt && f.updatedAt.timestampValue || '', sha256: strOf(f.sha256),
+      deltaPrefix: strOf(f.deltaPrefix), deltaChunks: intOf(f.deltaChunks) };
   }
 
   async function readMeta(tk, packId, collection) {
@@ -286,7 +327,143 @@
         catch (e) { /* leftover chunk is harmless */ }
       }
     }
+    // ... and the previous "changes only" package.
+    var newDelta = opts.extra && opts.extra.deltaPrefix ? opts.extra.deltaPrefix.stringValue : '';
+    if (previous && previous.deltaPrefix && previous.deltaPrefix !== newDelta) {
+      for (var k = 0; k < previous.deltaChunks; k++) {
+        try { await request(base + '/chunks/' + previous.deltaPrefix + '_' + pad(k), { method: 'DELETE', headers: authHeaders(tk) }); }
+        catch (e) { /* leftover chunk is harmless */ }
+      }
+    }
     return { version: version, questions: questions, gzBytes: gz.length, rawBytes: raw.length, chunkCount: count, updatedAt: updatedAt, packId: packId };
+  }
+
+  /* ------------------------------------------------------------------ "changes only" package (partial update)
+   * A student who already has the previous published version downloads only what changed since it: the new and
+   * corrected items and the list of removed ones. It is built by comparing the new package with the one that is
+   * published right now (downloaded here, so it is always the real previous version, on any admin device).
+   * The student's app checks the result against uidDigest and takes the full bank whenever anything does not fit;
+   * every other student (new device, older version) takes the full bank as before. Best effort: any problem here
+   * simply means no partial package this time.                                                                    */
+  var DELTA_LISTS = ['questions', 'lectures', 'flashcards', 'bookMeta'];
+  var DELTA_FOLDER = { questions: 'images', lectures: 'summaries', flashcards: 'flashcards', bookMeta: 'books' };
+  var DELTA_MAX_SHARE = 0.6;        // a partial package larger than this share of the full one is not worth it
+
+  async function downloadPackBytes(tk, packId, meta) {
+    var root = FS.replace('https://firestore.googleapis.com/v1/', '');
+    var parts = new Array(meta.chunkCount);
+    for (var start = 0; start < meta.chunkCount; start += 6) {
+      var names = [];
+      for (var i = start; i < Math.min(meta.chunkCount, start + 6); i++) names.push(root + '/packs/' + packId + '/chunks/' + meta.prefix + '_' + pad(i));
+      var got = await request(FS + ':batchGet', { method: 'POST', headers: authHeaders(tk, true), body: JSON.stringify({ documents: names }) });
+      got.forEach(function (entry) {
+        if (!entry.found) throw new Error('a part of the published bank is missing');
+        var bin = atob(entry.found.fields.data.bytesValue || ''), out = new Uint8Array(bin.length);
+        for (var b = 0; b < bin.length; b++) out[b] = bin.charCodeAt(b);
+        parts[intOf(entry.found.fields.i)] = out;
+      });
+    }
+    var total = 0; parts.forEach(function (x) { if (!x) throw new Error('a part of the published bank is missing'); total += x.length; });
+    var gz = new Uint8Array(total), off = 0; parts.forEach(function (x) { gz.set(x, off); off += x.length; });
+    if (meta.sha256 && hex(await crypto.subtle.digest('SHA-256', gz)) !== meta.sha256) throw new Error('the published bank did not arrive whole');
+    return new Uint8Array(await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+  }
+
+  function deltaFilePath(image, list) {
+    var path = typeof image === 'string' ? image : image && image.path;
+    if (typeof path !== 'string' || !path) return '';
+    return path.indexOf('/') !== -1 ? path : DELTA_FOLDER[list] + '/' + path;
+  }
+
+  // Everything that makes an item what the student sees: its fields (not the package stamp) and the bytes of its images.
+  async function deltaSignatures(zip, database) {
+    var fileHash = new Map(), out = {};
+    for (var li = 0; li < DELTA_LISTS.length; li++) {
+      var list = DELTA_LISTS[li], map = new Map(), items = database[list] || [];
+      for (var n = 0; n < items.length; n++) {
+        var item = items[n];
+        if (!item || typeof item.uid !== 'string' || !item.uid || map.has(item.uid)) throw new Error('an item without its own uid');
+        var copy = Object.assign({}, item); delete copy.pkgVersion;
+        var sig = JSON.stringify(copy), files = [];
+        var images = Array.isArray(item.images) ? item.images : [];
+        for (var m = 0; m < images.length; m++) {
+          var path = deltaFilePath(images[m], list);
+          if (!path) continue;
+          if (!fileHash.has(path)) {
+            var entry = zip.file(path);
+            fileHash.set(path, entry ? hex(await crypto.subtle.digest('SHA-256', await entry.async('uint8array'))) : 'absent');
+          }
+          sig += '|' + path + ':' + fileHash.get(path);
+          if (fileHash.get(path) !== 'absent') files.push(path);
+        }
+        map.set(item.uid, { sig: sig, files: files });
+      }
+      out[list] = map;
+    }
+    return out;
+  }
+
+  async function buildDelta(tk, spec, previous, raw, progress) {
+    if (!previous || !previous.version || !previous.prefix || !previous.chunkCount || packOwner(previous) !== spec.id) return null;
+    if (typeof JSZip === 'undefined' || !window.__entUpdatePkg || !window.__entUpdatePkg.sha256Hex) return null;
+    progress('Comparing with the published version...');
+    var oldZip = await JSZip.loadAsync(await downloadPackBytes(tk, spec.id, previous));
+    var newZip = await JSZip.loadAsync(raw);
+    var oldDb = JSON.parse(await oldZip.file('database.json').async('string'));
+    var newDb = JSON.parse(await newZip.file('database.json').async('string'));
+    var manifest = JSON.parse(await newZip.file('manifest.json').async('string'));
+    if (manifest.packageVersion === previous.version) return null;
+    var before = await deltaSignatures(oldZip, oldDb), after = await deltaSignatures(newZip, newDb);
+
+    var database = Object.assign({}, newDb), removed = {}, files = new Set(), changed = 0, removedCount = 0;
+    DELTA_LISTS.forEach(function (list) {
+      database[list] = (newDb[list] || []).filter(function (item) {
+        var now = after[list].get(item.uid), was = before[list].get(item.uid);
+        if (was && was.sig === now.sig) return false;
+        now.files.forEach(function (f) { files.add(f); });
+        changed++;
+        return true;
+      });
+      removed[list] = [];
+      before[list].forEach(function (v, uid) { if (!after[list].has(uid)) removed[list].push(uid); });
+      removedCount += removed[list].length;
+    });
+    var sameTaxonomy = JSON.stringify([oldDb.taxonomy || null, oldDb.taxonomyV2 || null]) === JSON.stringify([newDb.taxonomy || null, newDb.taxonomyV2 || null]);
+    if (!sameTaxonomy) return null;                        // the classification changed: the full bank carries it
+    delete database.taxonomy; delete database.taxonomyV2;  // unchanged: the device already has it
+
+    var uids = (newDb.questions || []).map(function (q) { return q.uid; }).sort();
+    var uidDigest = hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(uids.join('\n'))));
+    var text = JSON.stringify(database);
+    manifest.checksum = await window.__entUpdatePkg.sha256Hex(text);
+    manifest.partial = { from: previous.version, removed: removed, changed: changed, questions: uids.length, uidDigest: uidDigest };
+    manifest.contentSummary = Object.assign({}, manifest.contentSummary, { questions: database.questions.length, lectures: database.lectures.length,
+      flashcards: database.flashcards.length, bookMeta: database.bookMeta.length, images: files.size });
+    if (manifest.assetChecksums) {
+      var sums = {};
+      Object.keys(manifest.assetChecksums).forEach(function (path) { if (files.has(path)) sums[path] = manifest.assetChecksums[path]; });
+      manifest.assetChecksums = sums;
+    }
+    var zip = new JSZip();
+    zip.file('manifest.json', JSON.stringify(manifest));
+    zip.file('database.json', text);
+    var list = Array.from(files);
+    for (var i = 0; i < list.length; i++) zip.file(list[i], await newZip.file(list[i]).async('uint8array'));
+    var gz = await gzipBytes(await zip.generateAsync({ type: 'uint8array' }));
+    return { gz: gz, sha: hex(await crypto.subtle.digest('SHA-256', gz)), from: previous.version, changed: changed, removed: removedCount, uidDigest: uidDigest };
+  }
+
+  // Uploads the partial package next to the full one; returns the fields that advertise it in the pack document.
+  async function uploadDelta(tk, spec, version, delta, progress) {
+    var prefix = 'd' + String(version).replace(/[^A-Za-z0-9]/g, '');
+    var count = Math.max(1, Math.ceil(delta.gz.length / CHUNK_BYTES));
+    for (var i = 0; i < count; i++) {
+      progress('Uploading the changes-only package ' + (i + 1) + ' / ' + count + '...');
+      var part = delta.gz.subarray(i * CHUNK_BYTES, Math.min(delta.gz.length, (i + 1) * CHUNK_BYTES));
+      await request(FS + '/packs/' + encodeURIComponent(spec.id) + '/chunks/' + prefix + '_' + pad(i), { method: 'PATCH', headers: authHeaders(tk, true),
+        body: JSON.stringify({ fields: { prefix: sv(prefix), i: iv(i), data: { bytesValue: bytesToB64(part) } } }) });
+    }
+    return { deltaFrom: sv(delta.from), deltaPrefix: sv(prefix), deltaChunks: iv(count), deltaSha: sv(delta.sha), deltaGzBytes: iv(delta.gz.length), uidDigest: sv(delta.uidDigest) };
   }
 
   async function gzipBytes(raw) {
@@ -299,9 +476,29 @@
    * subscription and students whose subscription ended, and it changes for all of them each time you publish.
    * freeUids lists the free questions, so a question you unmark stops being free on the students' devices too.
    */
+  // Counts only (no questions): how many different questions the full bank has, per category and per book. It travels
+  // with the free version, so a student without a subscription sees what a subscription opens.
+  function bankSummary(all) {
+    var seen = new Set(), inBook = new Set(), cats = {}, books = {}, total = 0;
+    var keyOf = (typeof QuestionImport !== 'undefined' && QuestionImport.dupKey) ? QuestionImport.dupKey : function () { return ''; };
+    all.forEach(function (q) {
+      var key = keyOf(q) || ('id:' + q.id);
+      var book = String(q.book || q.group || '').trim();
+      if (book && !inBook.has(book + '\u0000' + key)) { inBook.add(book + '\u0000' + key); books[book] = (books[book] || 0) + 1; }
+      if (seen.has(key)) return;
+      seen.add(key); total++;
+      var cat = q.subject || 'Uncategorized';
+      cats[cat] = (cats[cat] || 0) + 1;
+    });
+    var list = function (o) { return Object.keys(o).sort(function (a, b) { return o[b] - o[a] || a.localeCompare(b); }).slice(0, 200).map(function (k) { return [k.slice(0, 120), o[k]]; }); };
+    return { total: total, categories: list(cats), books: list(books) };
+  }
+
   async function publishFree(tk, spec, U, progress) {
     var max = (window.ENT_FREE_SAMPLE && window.ENT_FREE_SAMPLE.max) || 250;
-    var free = (await db.getAllQuestions()).filter(function (q) { return q.isFree === true; });
+    var everything = await db.getAllQuestions();
+    var summary = sv(JSON.stringify(bankSummary(everything)));
+    var free = everything.filter(function (q) { return q.isFree === true; });
     if (free.length > max) {
       throw cloudError('FREE_LIMIT', { message: free.length + ' questions are marked Free but the free version is limited to ' + max + '. Unmark ' + (free.length - max) + ' in Questions, then publish again. Nothing was uploaded.' });
     }
@@ -311,7 +508,7 @@
       var prev = await readMeta(tk, spec.id, 'freepacks');
       await request(base, { method: 'PATCH', headers: authHeaders(tk, true), body: JSON.stringify({ fields: {
         version: sv('empty-' + Date.now()), prefix: sv(''), chunkCount: iv(0), gzBytes: iv(0), rawBytes: iv(0), sha256: sv(''), questions: iv(0),
-        updatedAt: tv(new Date().toISOString()), specialtyId: sv(spec.id), specialtyName: sv(spec.name), schemaVersion: iv(Core.SCHEMA_VERSION),
+        updatedAt: tv(new Date().toISOString()), specialtyId: sv(spec.id), specialtyName: sv(spec.name), schemaVersion: iv(Core.SCHEMA_VERSION), summary: summary,
         freeUids: { arrayValue: {} } } }) });
       if (prev && prev.prefix) {
         for (var j = 0; j < prev.chunkCount; j++) {
@@ -339,7 +536,7 @@
     var sha = hex(await crypto.subtle.digest('SHA-256', gz));
     var info = await uploadPack(tk, spec.id, spec, built, gz, sha, raw, progress, {
       collection: 'freepacks', label: 'free version ',
-      extra: { freeUids: { arrayValue: { values: uids.map(function (u) { return sv(u); }) } } }
+      extra: { freeUids: { arrayValue: { values: uids.map(function (u) { return sv(u); }) } }, summary: summary }
     });
     return { questions: info.questions, version: info.version };
   }
@@ -373,10 +570,20 @@
     var gz = await gzipBytes(raw);
     var sha = hex(await crypto.subtle.digest('SHA-256', gz));
 
-    var main = await uploadPack(tk, spec.id, spec, built, gz, sha, raw, progress);
+    // Students who have the version published now only need what changed (best effort, see buildDelta).
+    var extra = null, partial = null;
+    try {
+      var delta = await buildDelta(tk, spec, await readMeta(tk, spec.id), raw, progress);
+      if (delta && delta.gz.length <= gz.length * DELTA_MAX_SHARE) {
+        extra = await uploadDelta(tk, spec, built.manifest.packageVersion, delta, progress);
+        partial = { gzBytes: delta.gz.length, changed: delta.changed, removed: delta.removed, from: delta.from };
+      }
+    } catch (e) { console.warn('[cloud-admin] no changes-only package this time:', e); extra = null; partial = null; }
+
+    var main = await uploadPack(tk, spec.id, spec, built, gz, sha, raw, progress, extra ? { extra: extra } : undefined);
     if (mirror) await uploadPack(tk, LEGACY_PACK_ID, spec, built, gz, sha, raw, progress);
 
-    var info = Object.assign({}, main, { specialtyId: spec.id, specialtyName: spec.name, legacyMirror: mirror });
+    var info = Object.assign({}, main, { specialtyId: spec.id, specialtyName: spec.name, legacyMirror: mirror, partial: partial });
     save(infoKey(spec.id), info);
     return info;
   }
@@ -425,6 +632,7 @@
       contactConsent: !!(f.contactConsent && f.contactConsent.booleanValue === true),
       lastCode: strOf(f.lastCode),
       lastCodeAt: tsMs(f.lastCodeAt),
+      lastSeenAt: tsMs(f.lastSeenAt) || 0,
       request: req ? { specialtyId: strOf(req.specialtyId), specialtyName: strOf(req.specialtyName), requestedAt: tsMs(req.requestedAt) || 0 } : null
     };
   }
@@ -476,27 +684,6 @@
     });
     a.plan = plan;
     a.expiresAt = expiresAt || null;
-  }
-
-  // End or (re)start a free trial. Stopping also clears any custom end date. Starting sets the end to N days from now
-  // and, for an old account that has no creation time (the rules need one), stamps it now.
-  async function saveTrial(a, days) {
-    var tk = await token();
-    var fields, mask;
-    if (days === null) {
-      fields = { trialStopped: { booleanValue: true }, trialEndsAt: { nullValue: null } };
-      mask = ['trialStopped', 'trialEndsAt'];
-    } else {
-      var endMs = Date.now() + days * 86400000;
-      fields = { trialStopped: { booleanValue: false }, trialEndsAt: tv(new Date(endMs).toISOString()) };
-      mask = ['trialStopped', 'trialEndsAt'];
-      if (!a.createdAt) { fields.createdAt = tv(new Date().toISOString()); mask.push('createdAt'); }
-    }
-    await request(FS + '/users/' + encodeURIComponent(a.uid) + '?' + mask.map(function (m) { return 'updateMask.fieldPaths=' + m; }).join('&'), {
-      method: 'PATCH', headers: authHeaders(tk, true), body: JSON.stringify({ fields: fields })
-    });
-    if (days === null) { a.trialStopped = true; a.trialEndsAt = null; }
-    else { a.trialStopped = false; a.trialEndsAt = Date.now() + days * 86400000; if (!a.createdAt) a.createdAt = Date.now(); }
   }
 
   // +N months counts from the current expiry while the account is still active, otherwise from today.
@@ -643,7 +830,7 @@
       if (a.createdAt) {
         var created = document.createElement('span');
         created.style.cssText = 'font-size:0.75rem;color:var(--text-muted);margin-left:8px;';
-        created.textContent = 'joined ' + fmtDay(a.createdAt);
+        created.textContent = 'joined ' + fmtDay(a.createdAt) + (a.lastSeenAt ? ' · last opened ' + agoText(a.lastSeenAt) : '');
         top.appendChild(created);
       }
       row.appendChild(top);
@@ -715,7 +902,7 @@
       var actions = document.createElement('div');
       actions.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;';
       [['code', 'Activation code'], ['m1', '+1 month'], ['m3', '+3 months'], ['m12', '+12 months'], ['date', 'Set date'],
-        ['spec', 'Change specialty'], ['stop', 'Stop']].forEach(function (pair) {
+        ['spec', 'Change specialty'], ['devices', 'Devices'], ['stop', 'Stop']].forEach(function (pair) {
         var b2 = document.createElement('button');
         b2.type = 'button';
         b2.className = 'btn btn-sm ' + (pair[0] === 'stop' ? 'btn-danger' : pair[0] === 'code' ? 'btn-primary' : 'btn-outline');
@@ -724,8 +911,49 @@
         actions.appendChild(b2);
       });
       row.appendChild(actions);
+      var devBox = document.createElement('div');
+      devBox.className = 'ent-acct-devices';
+      devBox.style.cssText = 'display:none;margin-top:8px;padding:8px 10px;border-radius:10px;background:var(--surface-hover);font-size:0.84rem;';
+      row.appendChild(devBox);
       list.appendChild(row);
     });
+  }
+
+  function agoText(ms) {
+    var days = Math.floor((Date.now() - ms) / 86400000);
+    return days <= 0 ? 'today' : days === 1 ? 'yesterday' : days < 60 ? days + ' days ago' : fmtDay(ms);
+  }
+
+  // The devices panel of one account row: the list, and Reset devices.
+  async function showDevices(a, row) {
+    var box = row.querySelector('.ent-acct-devices');
+    if (!box) return;
+    box.style.display = 'block';
+    box.textContent = 'Loading devices...';
+    var data = await readDevices(a.uid);
+    box.textContent = '';
+    var head = document.createElement('div');
+    head.style.fontWeight = '700';
+    head.textContent = data.list.length ? data.list.length + ' of ' + accessSettings.maxDevices + ' device(s) in use' : 'No device registered yet (the student has not opened the new app).';
+    box.appendChild(head);
+    data.list.forEach(function (d) {
+      var line = document.createElement('div');
+      line.className = 'ent-acct-device';
+      line.textContent = d.label + (d.addedAt ? ' · added ' + fmtDay(d.addedAt) : '');
+      box.appendChild(line);
+    });
+    if (data.lastSwapAt) {
+      var sw = document.createElement('div');
+      sw.style.color = 'var(--text-muted)';
+      sw.textContent = 'Last replaced a device on ' + fmtDay(data.lastSwapAt) + '.';
+      box.appendChild(sw);
+    }
+    if (data.list.length) {
+      var rb = document.createElement('button');
+      rb.type = 'button'; rb.className = 'btn btn-sm btn-danger'; rb.style.marginTop = '8px';
+      rb.setAttribute('data-act', 'devices-reset'); rb.textContent = 'Reset devices';
+      box.appendChild(rb);
+    }
   }
 
   function chooseSpecialty(a) {
@@ -759,6 +987,17 @@
     var a = accounts.filter(function (x) { return row && x.uid === row.getAttribute('data-uid'); })[0];
     if (!a) return;
     if (act === 'code') return issueCodeFor(a);
+    if (act === 'devices' || act === 'devices-reset') {
+      try {
+        if (act === 'devices-reset') {
+          if (!window.confirm('Reset the devices of ' + a.identifier + '? Every device is signed out of the list; the next ' + accessSettings.maxDevices + ' device(s) that open the app are registered again.')) return;
+          await resetDevices(a.uid);
+          acctMsg('Devices of ' + a.identifier + ' were reset.');
+        }
+        await showDevices(a, row);
+      } catch (err) { acctMsg('Could not read the devices of ' + a.identifier + ': ' + friendly(err), true); }
+      return;
+    }
     try {
       if (act === 'm1') await extendAccount(a, 1, '1m');
       else if (act === 'm3') await extendAccount(a, 3, '3m');
@@ -1349,6 +1588,232 @@
       '<div id="entScopeMsg" style="margin-top:8px;font-size:0.82rem;color:var(--text2);"></div></div>';
   }
 
+  function devicesCardHTML() {
+    return '<div class="card" id="entDevicesCard"><div class="card-header">Devices per account</div>' +
+      '<p style="font-size:0.85rem;color:var(--text2);">An account works on this many devices (a phone and a computer, for example). A third device is refused until the student signs one out, which is allowed once per the number of days below. ' +
+      'Open <b>Devices</b> on a student in Student accounts to see or reset theirs.</p>' +
+      '<div class="form-row"><div><label for="entMaxDevices">Devices per account</label><input type="number" id="entMaxDevices" min="1" max="10" step="1" inputmode="numeric"></div>' +
+      '<div><label for="entSwapDays">Days between replacements</label><input type="number" id="entSwapDays" min="0" max="90" step="1" inputmode="numeric"></div></div>' +
+      '<button class="btn btn-outline btn-block mt-2" id="btnDevicesSave">Save</button>' +
+      '<div id="entDevicesMsg" style="margin-top:8px;font-size:0.82rem;color:var(--text2);"></div></div>';
+  }
+
+  async function wireDevicesCard() {
+    var save = el('btnDevicesSave'), max = el('entMaxDevices'), days = el('entSwapDays'), msg = el('entDevicesMsg');
+    if (!save || !max || !days) return;
+    var say = function (text, isError) { if (msg) { msg.textContent = text || ''; msg.style.color = isError ? 'var(--danger)' : 'var(--text2)'; } };
+    try { var cur = await readAccess(); max.value = cur.maxDevices; days.value = cur.deviceSwapDays; }
+    catch (e) { max.value = accessSettings.maxDevices; days.value = accessSettings.deviceSwapDays; }
+    save.addEventListener('click', async function () {
+      if (typeof RBAC !== 'undefined' && !RBAC.requireAdmin()) return;
+      save.disabled = true;
+      try {
+        var out = await writeDeviceLimits(max.value, days.value);
+        say('Saved: ' + out.maxDevices + ' device(s) per account, a replacement every ' + out.deviceSwapDays + ' day(s).');
+      } catch (e) { say('Could not save: ' + friendly(e), true); }
+      finally { save.disabled = false; }
+    });
+  }
+
+  /* ------------------------------------------------------------------ board exam simulation (settings/board) */
+  // One small document for all specialties: { "<specialtyId>": { questions, minutes, mix: { "<category>": percent } } }.
+  // Students read it (Exam > Board exam simulation). Without an entry the app uses 100 questions in 120 minutes.
+
+  async function readBoard() {
+    var tk = await token();
+    try {
+      var d = await request(FS + '/settings/board', { headers: authHeaders(tk) });
+      var parsed = JSON.parse(strOf((d.fields || {}).json) || '{}');
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch (e) { if (e.status === 404) return {}; throw e; }
+  }
+
+  async function writeBoard(specId, config) {
+    var q = Number(config.questions), m = Number(config.minutes);
+    if (!isFinite(q) || Math.floor(q) !== q || q < 5 || q > 500) throw new Error('Questions must be a whole number from 5 to 500.');
+    if (!isFinite(m) || Math.floor(m) !== m || m < 1 || m > 600) throw new Error('Minutes must be a whole number from 1 to 600.');
+    var mix = null, sum = 0;
+    Object.keys(config.mix || {}).forEach(function (cat) {
+      var v = Number(config.mix[cat]);
+      if (!v) return;
+      if (!isFinite(v) || v < 0 || v > 100) throw new Error('Each percentage must be between 0 and 100.');
+      mix = mix || {}; mix[cat] = v; sum += v;
+    });
+    if (mix && Math.abs(sum - 100) > 0.01) throw new Error('The percentages add up to ' + sum + '%. They must add up to 100%, or leave them all empty.');
+    var all = await readBoard();
+    all[specId] = { questions: q, minutes: m, mix: mix };
+    var text = JSON.stringify(all);
+    if (text.length > 40000) throw new Error('The board settings are too large.');
+    var tk = await token();
+    await request(FS + '/settings/board', { method: 'PATCH', headers: authHeaders(tk, true),
+      body: JSON.stringify({ fields: { json: sv(text), updatedAt: tv(new Date().toISOString()) } }) });
+    return all[specId];
+  }
+
+  function boardCardHTML() {
+    var spec = currentSpec();
+    return '<div class="card" id="entBoardCard"><div class="card-header">Board exam simulation</div>' +
+      '<p style="font-size:0.85rem;color:var(--text2);">How long the real ' + esc(spec ? spec.name : '') + ' board exam is. Students get a <b>Board exam simulation</b> button in Exam with this length, and their score for each category. ' +
+      'The percentages are optional: leave them empty and the questions are spread like your bank.</p>' +
+      '<div class="form-row"><div><label for="entBoardQ">Questions</label><input type="number" id="entBoardQ" min="5" max="500" step="1" inputmode="numeric"></div>' +
+      '<div><label for="entBoardM">Minutes</label><input type="number" id="entBoardM" min="1" max="600" step="1" inputmode="numeric"></div></div>' +
+      '<div style="font-weight:700;margin:10px 0 4px;">Share of each category (%)</div>' +
+      '<div id="entBoardMix" style="display:grid;grid-template-columns:1fr 90px;gap:6px 10px;align-items:center;font-size:0.88rem;"></div>' +
+      '<div id="entBoardSum" style="font-size:0.82rem;color:var(--text2);margin-top:6px;"></div>' +
+      '<button class="btn btn-outline btn-block mt-2" id="btnBoardSave">Save</button>' +
+      '<div id="entBoardMsg" style="margin-top:8px;font-size:0.82rem;color:var(--text2);"></div></div>';
+  }
+
+  async function wireBoardCard() {
+    var save = el('btnBoardSave'), qEl = el('entBoardQ'), mEl = el('entBoardM'), mixEl = el('entBoardMix'), sumEl = el('entBoardSum'), msg = el('entBoardMsg');
+    var spec = currentSpec();
+    if (!save || !qEl || !mEl || !mixEl || !spec) return;
+    var say = function (text, isError) { if (msg) { msg.textContent = text || ''; msg.style.color = isError ? 'var(--danger)' : 'var(--text2)'; } };
+    var current = { questions: 100, minutes: 120, mix: null };
+    try { var all = await readBoard(); if (all[spec.id]) current = all[spec.id]; }
+    catch (e) { say('Could not read the current settings: ' + friendly(e), true); }
+    qEl.value = current.questions; mEl.value = current.minutes;
+    var cats = {};
+    try { (await db.getAllQuestions()).forEach(function (q) { var c = q.subject || 'Uncategorized'; cats[c] = (cats[c] || 0) + 1; }); } catch (e) { /* empty workspace */ }
+    Object.keys(current.mix || {}).forEach(function (c) { if (!(c in cats)) cats[c] = 0; });
+    var names = Object.keys(cats).sort(function (a, b) { return cats[b] - cats[a] || a.localeCompare(b); });
+    mixEl.textContent = '';
+    names.forEach(function (name) {
+      var label = document.createElement('label');
+      label.textContent = name + ' (' + cats[name] + ' questions)';
+      var input = document.createElement('input');
+      input.type = 'number'; input.min = '0'; input.max = '100'; input.step = '1'; input.inputMode = 'numeric';
+      input.className = 'ent-board-pct'; input.setAttribute('data-cat', name); input.setAttribute('aria-label', 'Percent for ' + name);
+      if (current.mix && current.mix[name]) input.value = current.mix[name];
+      label.htmlFor = input.id = 'entBoardPct' + mixEl.children.length;
+      mixEl.appendChild(label); mixEl.appendChild(input);
+    });
+    if (!names.length) mixEl.textContent = 'This workspace has no questions yet.';
+    var total = function () {
+      var sum = 0, any = false;
+      Array.prototype.forEach.call(mixEl.querySelectorAll('.ent-board-pct'), function (i) { var v = Number(i.value); if (v) { sum += v; any = true; } });
+      if (sumEl) { sumEl.textContent = any ? 'Total: ' + sum + '%' + (Math.abs(sum - 100) > 0.01 ? ' (must be 100%)' : '') : 'No percentages: the questions are spread like your bank.'; sumEl.style.color = any && Math.abs(sum - 100) > 0.01 ? 'var(--danger)' : 'var(--text2)'; }
+    };
+    mixEl.addEventListener('input', total); total();
+    save.addEventListener('click', async function () {
+      if (typeof RBAC !== 'undefined' && !RBAC.requireAdmin()) return;
+      var mix = {};
+      Array.prototype.forEach.call(mixEl.querySelectorAll('.ent-board-pct'), function (i) { if (Number(i.value)) mix[i.getAttribute('data-cat')] = Number(i.value); });
+      save.disabled = true;
+      try {
+        var out = await writeBoard(spec.id, { questions: qEl.value, minutes: mEl.value, mix: mix });
+        say('Saved: ' + out.questions + ' questions in ' + out.minutes + ' minutes' + (out.mix ? ', with your category shares.' : ', spread like the bank.') + ' Students see it within a few hours.');
+      } catch (e) { say('Could not save: ' + friendly(e), true); }
+      finally { save.disabled = false; }
+    });
+  }
+
+  /* ------------------------------------------------------------------ overview (statistics) */
+
+  function overviewCardHTML() {
+    return '<div class="card" id="entOverviewCard"><div class="card-header">Overview</div>' +
+      '<p style="font-size:0.85rem;color:var(--text2);">Students, activity and income at a glance. The numbers are read when you press the button (one read per account).</p>' +
+      '<select id="entOverviewSpec" aria-label="Specialty" style="margin-bottom:8px;"></select>' +
+      '<button class="btn btn-outline btn-block" id="btnOverviewLoad">Load overview</button>' +
+      '<div id="entOverviewBody" style="margin-top:10px;"></div>' +
+      '<div id="entOverviewMsg" style="margin-top:8px;font-size:0.82rem;color:var(--text2);"></div></div>';
+  }
+
+  // Pure calculation, so it can be tested: accounts + payments -> the numbers of the Overview card.
+  function overviewOf(list, pays, now) {
+    now = now || Date.now();
+    var DAY = 86400000;
+    var monthStart = new Date(now); monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0);
+    var lastMonthStart = new Date(monthStart); lastMonthStart.setMonth(lastMonthStart.getMonth() - 1);
+    var out = { total: list.length, active: 0, free: 0, expired: 0, newWeek: 0, seen7: 0, seen30: 0, plans: {}, ending: [],
+      incomeThisMonth: 0, incomeLastMonth: 0, paymentsThisMonth: 0, paymentsLastMonth: 0 };
+    list.forEach(function (a) {
+      var st = accessOf(a).kind;
+      out[st]++;
+      if (a.createdAt && now - a.createdAt < 7 * DAY) out.newWeek++;
+      if (a.lastSeenAt && now - a.lastSeenAt < 7 * DAY) out.seen7++;
+      if (a.lastSeenAt && now - a.lastSeenAt < 30 * DAY) out.seen30++;
+      if (st === 'active') {
+        out.plans[a.plan] = (out.plans[a.plan] || 0) + 1;
+        if (a.expiresAt - now <= 7 * DAY) out.ending.push(a);
+      }
+    });
+    out.ending.sort(function (x, y) { return x.expiresAt - y.expiresAt; });
+    var uids = {}; list.forEach(function (a) { uids[a.uid] = 1; });
+    (pays || []).forEach(function (p) {
+      if (p.status !== 'Activated' || p.env !== 'live' || !p.activatedAt || !uids[p.uid]) return;
+      if (p.activatedAt >= monthStart.getTime()) { out.incomeThisMonth += p.amount; out.paymentsThisMonth++; }
+      else if (p.activatedAt >= lastMonthStart.getTime()) { out.incomeLastMonth += p.amount; out.paymentsLastMonth++; }
+    });
+    return out;
+  }
+
+  function renderOverview() {
+    var body = el('entOverviewBody');
+    if (!body) return;
+    var specSel = el('entOverviewSpec');
+    var sid = specSel ? specSel.value : 'all';
+    var list = accounts.filter(function (a) { return sid === 'all' || a.specialtyId === sid; });
+    var o = overviewOf(list, payments);
+    var money = function (n) { return Number(n).toLocaleString('en-US') + ' IQD'; };
+    var tile = function (value, label, id) { return '<div class="stat-card"' + (id ? ' id="' + id + '"' : '') + '><div class="stat-value">' + esc(String(value)) + '</div><div class="stat-label">' + esc(label) + '</div></div>'; };
+    var plans = Object.keys(o.plans).sort().map(function (k) { return esc(k) + ': ' + o.plans[k]; }).join(' · ');
+    var html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;">' +
+      tile(o.total, 'Students', 'ovTotal') + tile(o.active, 'Subscribed', 'ovActive') + tile(o.free, 'Free version', 'ovFree') + tile(o.expired, 'Expired', 'ovExpired') +
+      tile(o.newWeek, 'New this week', 'ovNew') + tile(o.seen7, 'Opened in 7 days', 'ovSeen7') + tile(o.seen30, 'Opened in 30 days', 'ovSeen30') + '</div>' +
+      '<div id="ovIncome" style="margin:12px 0 4px;font-size:0.9rem;"><b>Income (online payments):</b> this month ' + money(o.incomeThisMonth) + ' (' + o.paymentsThisMonth + '), last month ' + money(o.incomeLastMonth) + ' (' + o.paymentsLastMonth + ').</div>' +
+      (plans ? '<div id="ovPlans" style="font-size:0.84rem;color:var(--text2);">Active subscriptions by plan: ' + plans + '</div>' : '') +
+      '<div style="font-weight:700;margin:14px 0 6px;">Ending within 7 days (' + o.ending.length + ')</div><div id="ovEnding"></div>';
+    body.innerHTML = html;
+    var endBox = el('ovEnding');
+    if (!o.ending.length) { endBox.textContent = 'No subscription ends this week.'; endBox.style.cssText = 'font-size:0.84rem;color:var(--text2);'; return; }
+    o.ending.forEach(function (a) {
+      var row = document.createElement('div');
+      row.className = 'ent-ov-ending';
+      row.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:8px 10px;border:1px solid var(--border);border-radius:10px;margin-bottom:6px;font-size:0.86rem;';
+      var days = Math.max(0, Math.ceil((a.expiresAt - Date.now()) / 86400000));
+      var text = document.createElement('span');
+      text.style.flex = '1';
+      text.textContent = a.identifier + ' · ' + (specLabel(a.specialtyId, a.specialtyName) || '') + ' · ends ' + fmtDay(a.expiresAt) + ' (' + days + (days === 1 ? ' day' : ' days') + ')';
+      row.appendChild(text);
+      var wa = whatsappLink(a.phone);
+      if (wa && a.contactConsent) {
+        var link = document.createElement('a');
+        link.className = 'btn btn-sm btn-success'; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.style.textDecoration = 'none';
+        link.href = wa + '?text=' + encodeURIComponent('Hello, this is Adam QBank. Your subscription (' + a.identifier + ') ends on ' + fmtDay(a.expiresAt) + '. You can renew from the app: Subscribe.');
+        link.textContent = 'WhatsApp reminder';
+        row.appendChild(link);
+      } else {
+        var none = document.createElement('span');
+        none.style.color = 'var(--text-muted)'; none.textContent = 'no mobile number';
+        row.appendChild(none);
+      }
+      endBox.appendChild(row);
+    });
+  }
+
+  function wireOverview() {
+    var btn = el('btnOverviewLoad'), sel = el('entOverviewSpec'), msg = el('entOverviewMsg');
+    if (!btn || !sel) return;
+    var specs = (window.EntRegistry ? window.EntRegistry.list() : []);
+    sel.innerHTML = '<option value="all">All specialties</option>' + specs.map(function (sp) { return '<option value="' + esc(sp.id) + '">' + esc(sp.name) + '</option>'; }).join('');
+    sel.addEventListener('change', function () { if (accounts.length) renderOverview(); });
+    btn.addEventListener('click', async function () {
+      if (typeof RBAC !== 'undefined' && !RBAC.requireAdmin()) return;
+      btn.disabled = true;
+      try {
+        if (msg) msg.textContent = 'Loading accounts...';
+        await loadAccounts(function (t) { if (msg) msg.textContent = t; });
+        try { await loadPayments(); } catch (e) { /* no payments yet, or the rules without payments: income shows 0 */ }
+        renderOverview();
+        renderAccounts();
+        if (msg) msg.textContent = 'Updated ' + new Date().toLocaleTimeString() + '.';
+      } catch (e) {
+        if (msg) { msg.textContent = 'Could not load the overview: ' + friendly(e); msg.style.color = 'var(--danger)'; }
+      } finally { btn.disabled = false; }
+    });
+  }
+
   function scopeMsg(text, isError) {
     var node = el('entScopeMsg');
     if (!node) return;
@@ -1520,7 +1985,7 @@
       '<button class="btn btn-accent btn-block mt-2" id="btnCloudPublish">Publish ' + esc(spec.name) + ' question bank</button>' +
       '<button class="btn btn-outline btn-block mt-2" id="btnCloudSignOut">Sign out</button>' +
       '<div id="entCloudMsg" style="margin-top:10px;font-size:0.82rem;color:var(--text2);"></div></div>' +
-      freeCardHTML() + accessCardHTML() + accountsCardHTML() + reportsCardHTML() + migrationCardHTML();
+      freeCardHTML() + boardCardHTML() + overviewCardHTML() + accessCardHTML() + devicesCardHTML() + accountsCardHTML() + reportsCardHTML() + migrationCardHTML();
   }
 
   function setMsg(text, isError) {
@@ -1566,6 +2031,9 @@
     var outBtn = el('btnCloudSignOut');
     if (outBtn) outBtn.addEventListener('click', function () { signOut(); rerender(); });
     wireFreeCard();
+    wireOverview();
+    wireDevicesCard();
+    wireBoardCard();
 
     var pubBtn = el('btnCloudPublish');
     if (pubBtn) pubBtn.addEventListener('click', async function () {
@@ -1597,7 +2065,8 @@
       try {
         var info2 = await publish(function (t) { setMsg(t); }, { legacyMirror: mirror });
         setMsg('Published ' + info2.specialtyName + ' ' + info2.version + ': ' + info2.questions + ' questions, ' + fmtBytes(info2.gzBytes) +
-          ' in ' + info2.chunkCount + ' part(s)' + (info2.legacyMirror ? ' (and the legacy ENT copy)' : '') + '.');
+          ' in ' + info2.chunkCount + ' part(s)' + (info2.legacyMirror ? ' (and the legacy ENT copy)' : '') + '.' +
+          (info2.partial ? ' Students who have the previous version download only the changes: ' + fmtBytes(info2.partial.gzBytes) + ' (' + info2.partial.changed + ' new or corrected, ' + info2.partial.removed + ' removed).' : ''));
         if (typeof showToast === 'function') showToast(info2.specialtyName + ' question bank published.', 'success');
         var lastEl = el('entCloudLast');
         if (lastEl) lastEl.textContent = info2.version + ' - ' + info2.questions + ' questions, ' + fmtBytes(info2.gzBytes);
@@ -1625,7 +2094,7 @@
   }
 
   window.EntCloudAdmin = {
-    cardHTML: cardHTML, wire: wire, publish: publish, publishFreeVersion: publishFreeVersion, signIn: signIn, signOut: signOut, isSignedIn: isSignedIn,
+    cardHTML: cardHTML, wire: wire, publish: publish, publishFreeVersion: publishFreeVersion, overviewOf: overviewOf, readDevices: readDevices, writeDeviceLimits: writeDeviceLimits, readBoard: readBoard, writeBoard: writeBoard, signIn: signIn, signOut: signOut, isSignedIn: isSignedIn,
     isConfigured: CONFIGURED, friendly: friendly,
     syncSpecialties: syncSpecialties, pullSpecialties: pullSpecialties, readScope: readScope, writeScope: writeScope,
     loadAccounts: loadAccounts,
